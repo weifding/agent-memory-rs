@@ -1,0 +1,3 @@
+# 构建产物（含 vendor/ 内嵌套 crate 的 target）
+target/
+.DS_Store
