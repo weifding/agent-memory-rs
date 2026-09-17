@@ -128,8 +128,8 @@ impl ServerHandler for MemoryHandler {
         let mut tools = vec![
             Tool::new(
                 "store_memory",
-                "Store a new memory",
-                schema(json!({"type":"object","properties":{"content":{"type":"string"},"namespace":{"type":"string"},"category":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"importance":{"type":"number"}},"required":["content"]})),
+                "Store a new memory. 单条记忆 content 上限 10000 字符，超长自动截断",
+                schema(json!({"type":"object","properties":{"content":{"type":"string","maxLength":10000,"description":"记忆正文，单条上限 10000 字符，超长截断"},"namespace":{"type":"string"},"category":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"importance":{"type":"number"}},"required":["content"]})),
             ),
             Tool::new(
                 "search_memory",
@@ -138,8 +138,8 @@ impl ServerHandler for MemoryHandler {
             ),
             Tool::new(
                 "update_memory",
-                "Update an existing memory",
-                schema(json!({"type":"object","properties":{"memory_id":{"type":"string"},"content":{"type":"string"},"importance":{"type":"number"},"category":{"type":"string"}},"required":["memory_id"]})),
+                "Update an existing memory. 更新 content 时同样受 10000 字符上限，超长自动截断",
+                schema(json!({"type":"object","properties":{"memory_id":{"type":"string"},"content":{"type":"string","maxLength":10000,"description":"更新后的正文，单条上限 10000 字符，超长截断"},"importance":{"type":"number"},"category":{"type":"string"}},"required":["memory_id"]})),
             ),
             Tool::new("get_memory", "Get a memory by ID", schema(json!({"type":"object","properties":{"memory_id":{"type":"string"}},"required":["memory_id"]}))),
             Tool::new("delete_memory", "Delete a memory by ID", schema(json!({"type":"object","properties":{"memory_id":{"type":"string"}},"required":["memory_id"]}))),
