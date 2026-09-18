@@ -50,6 +50,7 @@ pub const DEFAULT_RULES: &[Rule] = &[
     Rule { label: "Interface", entity: "MCP", keywords: &["mcp", "json-rpc"] },
     Rule { label: "System", entity: "TB128FU 平板", keywords: &["tb128fu", "联想平板", "ha1p9jkr"] },
     Rule { label: "System", entity: "智谱 GLM", keywords: &["glm", "智谱", "zhipu", "bigmodel"] },
+    Rule { label: "Family", entity: "家庭", keywords: &["聚餐", "22中", "高三13班", "家人", "家庭"] },
 ];
 
 fn push_unique(hits: &mut Vec<EntityHit>, label: &str, name: &str) {

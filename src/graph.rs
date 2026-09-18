@@ -17,7 +17,8 @@ const LOCK_POLL_INTERVAL_MS: u64 = 100;
 
 /// 允许的节点类型
 pub const NODE_LABELS: &[&str] = &[
-    "Hospital", "System", "Interface", "FaultCase", "Company", "Region", "Project", "MemoryRef",
+    "Hospital", "System", "Interface", "FaultCase", "Company", "Region", "Project", "Family",
+    "MemoryRef",
 ];
 
 /// 允许的关系类型 → (源Label, 目标Label)
@@ -35,6 +36,7 @@ pub const RELATIONS: &[(&str, &str, &str)] = &[
     ("COMPANY_MEMORY", "Company", "MemoryRef"),
     ("PROJECT_MEMORY", "Project", "MemoryRef"),
     ("REGION_MEMORY", "Region", "MemoryRef"),
+    ("FAMILY_MEMORY", "Family", "MemoryRef"),
 ];
 
 /// 图谱数据库句柄。
@@ -157,6 +159,7 @@ pub fn init_schema(db: &GraphDB) -> Result<()> {
         ("Company", "name STRING, industry STRING, created_at STRING", "name"),
         ("Region", "name STRING, province STRING, city STRING, created_at STRING", "name"),
         ("Project", "name STRING, status STRING, created_at STRING", "name"),
+        ("Family", "name STRING, note STRING, created_at STRING", "name"),
         ("MemoryRef", "memory_id STRING, content_preview STRING, created_at STRING", "memory_id"),
     ];
 
@@ -386,6 +389,7 @@ pub fn link_memory(
         ("Company", "COMPANY_MEMORY"),
         ("Project", "PROJECT_MEMORY"),
         ("Region", "REGION_MEMORY"),
+        ("Family", "FAMILY_MEMORY"),
     ];
     let relation = rel_map
         .iter()
