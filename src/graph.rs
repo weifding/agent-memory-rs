@@ -419,6 +419,29 @@ pub fn link_memory(
     create_relation(db, relation, entity_label, entity_name, "MemoryRef", memory_id)
 }
 
+/// 删除记忆引用节点及其全部入边（delete_memory 联动清理，防孤儿 MemoryRef）
+pub fn delete_memory_ref(db: &GraphDB, memory_id: &str) -> Result<bool> {
+    let check = format!(
+        "MATCH (m:MemoryRef {{memory_id: '{}'}}) RETURN count(m) AS cnt",
+        escape_str(memory_id)
+    );
+    let (_, rows) = db.query(&check)?;
+    let exists = rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|v| matches!(v, kuzu::Value::Int64(c) if *c > 0))
+        .unwrap_or(false);
+    if !exists {
+        return Ok(false);
+    }
+    let cypher = format!(
+        "MATCH (m:MemoryRef {{memory_id: '{}'}}) DETACH DELETE m",
+        escape_str(memory_id)
+    );
+    db.execute(&cypher)?;
+    Ok(true)
+}
+
 // ------------------------------------------------------------------
 // 聚合统计
 // ------------------------------------------------------------------

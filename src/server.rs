@@ -486,8 +486,28 @@ impl MemoryHandler {
     async fn handle_delete_memory(&self, args: &Value) -> Result<String> {
         let id = args["memory_id"].as_str().unwrap_or("");
         let deleted = self.storage.delete(id)?;
+        // 联动清理图谱 MemoryRef 节点及其全部边，防孤儿；失败仅告警不影响删除结果
+        #[cfg(feature = "graph")]
+        let graph_cleaned: bool = if let (Some(gdb), true) = (&self.graph, self.config.graph.enabled) {
+            match graph::delete_memory_ref(gdb, id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(target: "graph", memory_id = %id, error = %e, "delete_memory_ref failed");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(not(feature = "graph"))]
+        let graph_cleaned = false;
         if deleted {
-            tracing::info!(target: "memory::delete", memory_id = %id, "memory deleted");
+            tracing::info!(
+                target: "memory::delete",
+                memory_id = %id,
+                graph_ref_removed = graph_cleaned,
+                "memory deleted"
+            );
         } else {
             tracing::warn!(target: "memory::delete", memory_id = %id, "delete failed: memory not found");
         }

@@ -48,6 +48,8 @@ pub const DEFAULT_RULES: &[Rule] = &[
     Rule { label: "System", entity: "agent-memory-server", keywords: &["agent-memory-server", "memory server"] },
     Rule { label: "System", entity: "macOS", keywords: &["macos", "launchd", "anaconda", "brew"] },
     Rule { label: "Interface", entity: "MCP", keywords: &["mcp", "json-rpc"] },
+    Rule { label: "System", entity: "TB128FU 平板", keywords: &["tb128fu", "联想平板", "ha1p9jkr"] },
+    Rule { label: "System", entity: "智谱 GLM", keywords: &["glm", "智谱", "zhipu", "bigmodel"] },
 ];
 
 fn push_unique(hits: &mut Vec<EntityHit>, label: &str, name: &str) {

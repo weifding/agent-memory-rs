@@ -110,6 +110,24 @@ async fn main() -> Result<()> {
             linked_edges,
             "graph backfill done"
         );
+
+        // 孤儿清扫：图谱中存在但 SQLite 已删除的 MemoryRef 连边一起删掉
+        let live_ids: std::collections::HashSet<String> = memories.iter().map(|m| m.id.clone()).collect();
+        let mut orphans_removed = 0usize;
+        if let Ok((_, rows)) = gdb.query("MATCH (m:MemoryRef) RETURN m.memory_id AS id") {
+            for row in rows {
+                if let Some(kuzu::Value::String(id)) = row.first() {
+                    if !live_ids.contains(id) {
+                        if graph_api::delete_memory_ref(gdb, id).unwrap_or(false) {
+                            orphans_removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if orphans_removed > 0 {
+            tracing::info!(target: "graph", removed = orphans_removed, "orphan MemoryRef sweep done");
+        }
     }
 
     tracing::info!(
