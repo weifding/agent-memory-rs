@@ -27,21 +27,30 @@ examples/
 └── bench.rs     # 性能基准测试
 ```
 
-## 编译
+## 编译（跨平台开关）
 
-### 基础版（无图谱）
-
-```bash
-cargo build --release
-```
-
-### 图谱版（需 GCC 12+）
+通用命令（三平台等价）：
 
 ```bash
-cargo build --release --features graph
+cargo build --release                  # 基础版（无图谱）
+cargo build --release --features graph # 图谱版（kuzu，需平台工具链，见下表）
 ```
 
-> 注意：kuzu 0.11.3 的 C++ 依赖使用 AVX-512 FP16 指令，GCC 11 及以下无法编译。
+构建期平台开关由 `build.rs` 自动检测：启用 graph feature 时逐平台检查工具链
+（cmake / CLT / GCC 版本 / MSVC 环境），缺失时在编译最早期打印 `cargo:warning`
+与安装指引，而不是掉进 cmake 深处的报错。
+
+| 平台 | graph 版工具链要求 | 一键脚本 | 备注 |
+|---|---|---|---|
+| **macOS** (arm64/x86_64) | Xcode CLT（`xcode-select --install`）+ cmake（`brew install cmake`）；Apple clang 可直接编译 kuzu，**无需 GCC 12** | `./scripts/build.sh` | `--no-graph` 纯记忆版；`--target` 交叉 |
+| **Linux** (x86_64/aarch64) | GCC >= 12（或 clang >= 16）+ cmake；glibc >= 2.28 | `./scripts/build.sh` | 老系统用 `--musl` 静态编译；CC/CXX 可指向 gcc-12 |
+| **Windows** (x86_64 MSVC) | VS Build Tools 2022（C++ 桌面开发 + CMake）；建议在 x64 Native Tools Prompt 运行 | `.\scripts\build.ps1` | `-NoGraph` 纯记忆版；`-Target` 交叉（MinGW 不推荐） |
+
+CI：`.github/workflows/ci.yml` 在 macOS / Windows / Ubuntu 三平台 ×（graph / no-graph）
+六种组合上自动构建验证。纯记忆版（无 graph）为纯 Rust，无平台工具链要求。
+
+> kuzu 0.11.x 的 C++ 依赖使用 AVX-512 FP16 指令，Linux 下 GCC 11 及以下无法编译；
+> macOS 的 Apple clang 与 Windows 的 MSVC 不受此限制。
 
 ## 运行
 

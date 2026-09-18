@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.features }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        features: [no-graph, graph]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 平台工具链开关（graph feature 需要 cmake；Linux 需要 GCC>=12）
+      - name: Install toolchain (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+      - name: Install toolchain (macos)
+        if: matrix.os == 'macos-latest'
+        run: brew install cmake
+      - name: Toolchain info
+        shell: bash
+        run: |
+          cmake --version || true
+          cc --version || true
+
+      - name: Build (no-graph)
+        if: matrix.features == 'no-graph'
+        run: cargo build --release
+
+      - name: Build (graph)
+        if: matrix.features == 'graph'
+        run: cargo build --release --features graph
+
+      # 尚无单元测试，先保证可编译；补充 tests/ 后改为 cargo test
+      - name: Compile tests
+        run: cargo test --release --no-run ${{ matrix.features == 'graph' && '--features graph' || '' }}
