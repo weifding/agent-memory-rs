@@ -131,23 +131,27 @@ impl SQLiteStorage {
 
     pub fn delete(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let namespace: Option<String> = conn
+        // 事务化：memories / vectors / tombstones 三步原子完成，防中途失败丢墓碑
+        let tx = conn.unchecked_transaction()?;
+        let namespace: Option<String> = tx
             .query_row("SELECT namespace FROM memories WHERE id = ?", params![id], |r| {
                 r.get(0)
             })
             .optional()?;
 
-        let affected = conn.execute("DELETE FROM memories WHERE id = ?", params![id])?;
-        conn.execute("DELETE FROM memory_vectors WHERE id = ?", params![id])?;
+        let affected = tx.execute("DELETE FROM memories WHERE id = ?", params![id])?;
+        tx.execute("DELETE FROM memory_vectors WHERE id = ?", params![id])?;
 
         if affected > 0 {
             let now = chrono::Utc::now().to_rfc3339();
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO tombstones (id, namespace, deleted_at) VALUES (?, ?, ?)",
                 params![id, namespace.unwrap_or_else(|| "default".to_string()), now],
             )?;
+            tx.commit()?;
             return Ok(true);
         }
+        tx.commit()?;
         Ok(false)
     }
 

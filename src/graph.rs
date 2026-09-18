@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 /// 只读查询超时（毫秒），防止复杂多跳查询挂死
 const QUERY_TIMEOUT_MS: u64 = 5000;
+/// 只读查询返回行数上限（与 Python 版 execute_readonly 的 100 行对齐）
+const QUERY_MAX_ROWS: usize = 100;
 /// 跨进程等锁超时（毫秒）：操作队列化后，排队等前一个进程完成图谱操作
 const LOCK_WAIT_TIMEOUT_MS: u64 = 30_000;
 /// 等锁轮询间隔（毫秒）
@@ -123,7 +125,7 @@ impl GraphDB {
         })
     }
 
-    /// 执行只读查询，返回 (列名, 行数据)
+    /// 执行只读查询，返回 (列名, 行数据)。行数上限 QUERY_MAX_ROWS（与 Python 版 100 行对齐）
     pub fn query(&self, cypher: &str) -> Result<(Vec<String>, Vec<Vec<kuzu::Value>>)> {
         if !is_readonly(cypher) {
             return Err(anyhow!(
@@ -133,9 +135,15 @@ impl GraphDB {
         self.with_session(|conn| {
             // 复杂多跳查询超时保护（对应设计文档 5s 超时）
             conn.set_query_timeout(QUERY_TIMEOUT_MS);
-            let result = conn.query(cypher)?;
+            let mut result = conn.query(cypher)?;
             let columns = result.get_column_names();
-            let rows: Vec<Vec<kuzu::Value>> = result.collect();
+            let rows: Vec<Vec<kuzu::Value>> = result
+                .by_ref()
+                .take(QUERY_MAX_ROWS)
+                .collect();
+            if rows.len() == QUERY_MAX_ROWS {
+                tracing::warn!(target: "graph", rows = rows.len(), "query result truncated at QUERY_MAX_ROWS");
+            }
             Ok((columns, rows))
         })
     }
@@ -270,7 +278,27 @@ pub fn create_entity(
     Ok("created".to_string())
 }
 
+/// label 白名单校验（所有把 label 拼进 Cypher 的函数入口都必须调用）
+fn validate_label(label: &str) -> Result<()> {
+    if !NODE_LABELS.contains(&label) {
+        return Err(anyhow!("Invalid node label: {}", label));
+    }
+    Ok(())
+}
+
+/// 属性名白名单（标识符字符集），防 group_by 类参数注入
+fn validate_property_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok {
+        return Err(anyhow!("Invalid property name: {}", name));
+    }
+    Ok(())
+}
+
 pub fn get_entity(db: &GraphDB, label: &str, name: &str) -> Result<Option<String>> {
+    validate_label(label)?;
     let cypher = format!(
         "MATCH (n:{} {{name: '{}'}}) RETURN n.name AS name",
         label,
@@ -288,7 +316,8 @@ pub fn list_entities(
     label: &str,
     limit: usize,
 ) -> Result<Vec<String>> {
-    let cypher = format!("MATCH (n:{}) RETURN n.name AS name LIMIT {}", label, limit);
+    validate_label(label)?;
+    let cypher = format!("MATCH (n:{}) RETURN n.name AS name LIMIT {}", label, limit.min(1000));
     let (_, rows) = db.query(&cypher)?;
     let mut names = Vec::new();
     for row in rows {
@@ -300,6 +329,7 @@ pub fn list_entities(
 }
 
 pub fn delete_entity(db: &GraphDB, label: &str, name: &str) -> Result<bool> {
+    validate_label(label)?;
     if get_entity(db, label, name)?.is_none() {
         return Ok(false);
     }
@@ -455,6 +485,8 @@ pub fn aggregate_by_property(
     label: &str,
     group_by: &str,
 ) -> Result<Vec<(String, i64)>> {
+    validate_label(label)?;
+    validate_property_name(group_by)?;
     let cypher = format!(
         "MATCH (n:{}) RETURN n.{} AS key, count(*) AS cnt ORDER BY cnt DESC",
         label, group_by
@@ -525,16 +557,70 @@ pub fn get_related_memories(db: &GraphDB, label: &str, name: &str) -> Result<Vec
 // ------------------------------------------------------------------
 
 fn is_readonly(cypher: &str) -> bool {
-    let upper = cypher.trim().to_uppercase();
-    if !upper.starts_with("MATCH") && !upper.starts_with("OPTIONAL MATCH") {
-        return false;
-    }
-    for kw in ["CREATE", "DELETE", "SET", "DROP", "MERGE", "INSERT", "UPDATE", "ALTER", "COPY"] {
-        if upper.contains(kw) {
+    let stripped = strip_string_literals(cypher);
+    // 多语句（分号分隔）逐段校验，末尾空段忽略
+    for segment in stripped.split(';') {
+        let seg = segment.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let upper = seg.to_uppercase();
+        let is_match = upper.starts_with("OPTIONAL MATCH") || upper.starts_with("MATCH");
+        if !is_match {
             return false;
+        }
+        // 整词匹配禁用关键字（避免 created_at/updated_at 这类子串误伤）
+        let mut token = String::new();
+        for c in upper.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                token.push(c);
+            } else {
+                if FORBIDDEN_KEYWORDS.contains(&token.as_str()) {
+                    return false;
+                }
+                token.clear();
+            }
         }
     }
     true
+}
+
+/// 写/DDL/过程调用关键字（按词匹配，不含字符串字面量内的内容）
+const FORBIDDEN_KEYWORDS: &[&str] = &[
+    "CREATE", "DELETE", "DETACH", "SET", "DROP", "MERGE", "INSERT", "UPDATE", "ALTER", "COPY",
+    "REMOVE", "CALL", "LOAD", "FOREACH",
+];
+
+/// 剥离单引号字符串字面量的内容（保留引号本身），使关键字扫描只作用于语法部分。
+/// 处理 \' 与 '' 两种转义。
+fn strip_string_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_str = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '\'' => {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        in_str = false;
+                        out.push('\'');
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            if c == '\'' {
+                in_str = true;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn escape_str(s: &str) -> String {
