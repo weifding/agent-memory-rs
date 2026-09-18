@@ -1,5 +1,40 @@
 # 修改记录（agent-memory-rs）
 
+## 2026-09-18 — Embedding 自动检测与真实向量接入
+
+### 背景
+
+语义检索此前用"字符 bigram 哈希伪嵌入"（`pseudo_embedding`）凑合：本质是表面字符
+重合度，不懂同义改写。config 里的 `embedding.provider/base_url/model` 字段一直是摆设。
+
+### 实现
+
+1. **新增 `src/embedding.rs`**
+   - OpenAI 兼容 `/v1/embeddings` 客户端（hyper-util legacy client，仅 http；
+     依赖树刻意不带 TLS 栈，本地服务场景够用，云端走本地反代）
+   - 启动时并发探测本地服务：LM Studio:1234 / Ollama:11434 / vLLM:8000 /
+     Xinference:9997 / llama.cpp:8080，`EMBEDDING_BASE_URL` 环境变量可指定
+   - 模型挑选偏好 WeMM > 含 embed 字样 > bge/gte/e5；探测时试算真实维度
+     并回填 `embedding.*` 配置
+2. **向量空间一致性**（`kv_meta.embedding_space`）
+   - 空间标识 `openai:<model>@<dim>` / `pseudo-bigram@<dim>`，启动时比对，
+     变化即自动重嵌全部存量记忆（分批 500 条），避免新旧向量混用导致相似度失真
+3. **接线**：`MemoryHandler` 增加 `embedding` 字段；store/search/update 三处
+   调用点统一走 `embed_text`（服务器在线时真实嵌入，离线时伪嵌入；真实嵌入
+   调用失败直接报错而非静默回退，防止污染向量空间）
+
+### 验证
+
+三阶段实测（Windows + mock OpenAI 兼容服务器 @1234）：未检测到→伪嵌入回退；
+mock 在线→自动检测命中 `WeMM-Embedding-2B@64` + 存量重嵌 + 读写走真实向量；
+mock 下线→自动回退并重嵌回伪嵌入空间。
+
+## 2026-09-18 — Windows 构建适配
+
+- `scripts/build.ps1` 加 UTF-8 BOM（修复 PowerShell 5.1 中文解析失败），
+  自动补齐 VS 自带 cmake/ninja 到 PATH；README 记录 debug+graph 的 4GiB rlib 限制
+- 实测 VS2019 BuildTools + rustc 1.93 可完成 release+graph 编译（19min）
+
 ## 2026-09-08（晚）— 修复 ZCode MCP 挂载失败（未提交）
 
 ### 背景

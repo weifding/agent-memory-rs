@@ -26,6 +26,11 @@ dirs = "5"
 fs2 = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# embedding 客户端：仅本地 http 场景，复用依赖树中已有的 hyper，不引入 TLS 栈
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+futures = "0.3"
 
 [profile.release]
 opt-level = 3

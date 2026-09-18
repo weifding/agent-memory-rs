@@ -11,10 +11,10 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
+use crate::embedding::{char_bigrams, EmbeddingClient};
 use crate::models::{Memory, MemorySearchResult};
 use crate::storage::SQLiteStorage;
 
@@ -32,18 +32,39 @@ pub struct MemoryHandler {
     pub graph: Option<Arc<GraphDB>>,
     #[cfg(not(feature = "graph"))]
     pub graph: Option<Arc<()>>,
+    pub embedding: Option<Arc<EmbeddingClient>>,
     pub config: AppConfig,
 }
 
 impl MemoryHandler {
     #[cfg(feature = "graph")]
-    pub fn new(storage: Arc<SQLiteStorage>, graph: Option<Arc<GraphDB>>, config: AppConfig) -> Self {
-        Self { storage, graph, config }
+    pub fn new(
+        storage: Arc<SQLiteStorage>,
+        graph: Option<Arc<GraphDB>>,
+        embedding: Option<Arc<EmbeddingClient>>,
+        config: AppConfig,
+    ) -> Self {
+        Self { storage, graph, embedding, config }
     }
 
     #[cfg(not(feature = "graph"))]
-    pub fn new(storage: Arc<SQLiteStorage>, _graph: Option<Arc<()>>, config: AppConfig) -> Self {
-        Self { storage, graph: None, config }
+    pub fn new(
+        storage: Arc<SQLiteStorage>,
+        _graph: Option<Arc<()>>,
+        embedding: Option<Arc<EmbeddingClient>>,
+        config: AppConfig,
+    ) -> Self {
+        Self { storage, graph: None, embedding, config }
+    }
+
+    /// 生成文本嵌入：检测到 embedding 服务器时走 OpenAI 兼容接口（失败即报错，
+    /// 避免伪嵌入向量混入真实向量空间），否则用字符 bigram 伪嵌入
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        if let Some(c) = &self.embedding {
+            let mut v = c.embed(&[text]).await?;
+            return Ok(v.remove(0));
+        }
+        Ok(crate::embedding::pseudo_embedding(text, self.storage.embedding_dim()))
     }
 }
 
@@ -293,8 +314,8 @@ impl MemoryHandler {
         );
         memory.entities = hits.iter().map(|h| h.display()).collect();
 
-        // 写入字符 bigram 伪嵌入（接入真实 embedding 提供方后替换为 provider 输出）
-        let embedding = pseudo_embedding(&memory.content, self.storage.embedding_dim());
+        // 嵌入：embedding 服务器在线时用真实向量，否则字符 bigram 伪嵌入
+        let embedding = self.embed_text(&memory.content).await?;
         let id = self.storage.store(&memory, Some(&embedding))?;
         tracing::info!(
             target: "memory::store",
@@ -362,9 +383,9 @@ impl MemoryHandler {
 
         let mut results: Vec<MemorySearchResult> = Vec::new();
 
-        // ① 向量检索路径：库中存在向量时，以字符 bigram 伪嵌入查询
+        // ① 向量检索路径：库中存在向量时，用同一嵌入函数编码查询
         if !query.is_empty() && self.storage.has_vectors()? {
-            let emb = pseudo_embedding(query, self.storage.embedding_dim());
+            let emb = self.embed_text(query).await?;
             let hits = self
                 .storage
                 .search(&emb, namespace.as_deref(), top_k, category.as_deref())?;
@@ -435,7 +456,7 @@ impl MemoryHandler {
         let mut new_embedding = None;
         if let Some(c) = &content {
             if !c.is_empty() {
-                new_embedding = Some(pseudo_embedding(c, self.storage.embedding_dim()));
+                new_embedding = Some(self.embed_text(c).await?);
             }
         }
 
@@ -664,19 +685,6 @@ fn kuzu_value_to_json(v: &kuzu::Value) -> Value {
         kuzu::Value::String(s) => Value::String(s.clone()),
         kuzu::Value::List(_, l) => Value::Array(l.iter().map(kuzu_value_to_json).collect()),
         _ => Value::String(format!("{:?}", v)),
-    }
-}
-
-/// 字符 bigram 集合：中文无需分词即可产生重叠特征，英文/混合文本同样有效
-fn char_bigrams(s: &str) -> HashSet<String> {
-    let chars: Vec<char> = s.chars().collect();
-    match chars.len() {
-        0 => HashSet::new(),
-        1 => [chars[0].to_string()].into_iter().collect(),
-        _ => chars
-            .windows(2)
-            .map(|w| w.iter().collect::<String>())
-            .collect(),
     }
 }
 

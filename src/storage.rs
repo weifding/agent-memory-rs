@@ -69,6 +69,11 @@ impl SQLiteStorage {
                 namespace TEXT NOT NULL DEFAULT 'default',
                 deleted_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS kv_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -423,6 +428,27 @@ impl SQLiteStorage {
         conn.execute(
             "INSERT OR REPLACE INTO memory_vectors (id, embedding) VALUES (?, ?)",
             params![id, blob],
+        )?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 元数据（向量空间标识等）
+    // ------------------------------------------------------------------
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row("SELECT value FROM kv_meta WHERE key = ?", params![key], |r| r.get(0))
+            .optional()?;
+        Ok(v)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
+            params![key, value],
         )?;
         Ok(())
     }

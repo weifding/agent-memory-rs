@@ -6,6 +6,7 @@
 
 - **记忆存储**：SQLite 持久化，支持 namespace、category、importance、entities、topics 等元数据
 - **向量检索**：纯 Rust 余弦相似度实现，支持 top-k 语义搜索
+- **Embedding 自动检测**：启动时并发探测本地 OpenAI 兼容 embedding 服务（LM Studio:1234 / Ollama:11434 / vLLM:8000 / Xinference:9997 / llama.cpp:8080，或 `EMBEDDING_BASE_URL` 指定），命中即自动配置 provider/model/维度并替换内置伪嵌入；向量空间变化时自动重嵌存量记忆。未检测到时回退字符 bigram 伪嵌入（零外部依赖），配置 `embedding.provider` 显式指定时跳过探测
 - **知识图谱**（可选）：Kùzu 嵌入式图数据库，支持实体/关系/多跳查询/按属性聚合
 - **记忆自动入图**（可选）：`store_memory` 时按内置/自定义词典 + 命名空间骨架自动抽取实体并生成图谱节点与 `*_MEMORY` 关联；启动时可对存量记忆幂等回填一次
 - **MCP 协议**：基于 rmcp 3.2，支持 stdio 与 HTTP（Streamable HTTP + SSE）两种传输，兼容 ZCode / Cursor / Claude Desktop 等 MCP 客户端

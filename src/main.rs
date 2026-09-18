@@ -54,6 +54,11 @@ async fn main() -> Result<()> {
     )?;
     let storage = Arc::new(storage);
 
+    // Embedding 提供方：显式配置直接采用，否则自动探测本地 OpenAI 兼容服务
+    //（LM Studio / Ollama / vLLM / Xinference / llama.cpp），命中即自动配置；
+    // 向量空间变化时自动重嵌存量记忆（见 embedding::setup）
+    let embedding = agent_memory_server::embedding::setup(&mut config, &storage).await?;
+
     // 图谱初始化（仅在启用 graph feature 且配置开启时）
     #[cfg(feature = "graph")]
     let graph: Option<Arc<agent_memory_server::graph::GraphDB>> = if config.graph.enabled {
@@ -71,7 +76,7 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "graph"))]
     let graph: Option<Arc<()>> = None;
 
-    let handler = MemoryHandler::new(storage.clone(), graph.clone(), config.clone());
+    let handler = MemoryHandler::new(storage.clone(), graph.clone(), embedding.clone(), config.clone());
 
     // 启动回填：把存量记忆按同一套抽取规则补建图谱（create_entity / link_memory 均幂等，可安全重复）
     #[cfg(feature = "graph")]
@@ -161,15 +166,17 @@ async fn main() -> Result<()> {
             }
 
             // 每个 HTTP 会话由 service_factory 创建独立的 MemoryHandler；
-            // Storage/GraphDB 通过 Arc 共享（Kùzu 保持单进程单连接）
+            // Storage/GraphDB/EmbeddingClient 通过 Arc 共享（Kùzu 保持单进程单连接）
             let factory_storage = storage.clone();
             let factory_graph = graph.clone();
+            let factory_embedding = embedding.clone();
             let factory_config = config.clone();
             let service = StreamableHttpService::new(
                 move || {
                     Ok(MemoryHandler::new(
                         factory_storage.clone(),
                         factory_graph.clone(),
+                        factory_embedding.clone(),
                         factory_config.clone(),
                     ))
                 },

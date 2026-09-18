@@ -1,4 +1,5 @@
 pub mod config;
+pub mod embedding;
 pub mod extract;
 #[cfg(feature = "graph")]
 pub mod graph;
