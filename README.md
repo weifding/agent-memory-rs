@@ -44,13 +44,18 @@ cargo build --release --features graph # 图谱版（kuzu，需平台工具链�
 |---|---|---|---|
 | **macOS** (arm64/x86_64) | Xcode CLT（`xcode-select --install`）+ cmake（`brew install cmake`）；Apple clang 可直接编译 kuzu，**无需 GCC 12** | `./scripts/build.sh` | `--no-graph` 纯记忆版；`--target` 交叉 |
 | **Linux** (x86_64/aarch64) | GCC >= 12（或 clang >= 16）+ cmake；glibc >= 2.28 | `./scripts/build.sh` | 老系统用 `--musl` 静态编译；CC/CXX 可指向 gcc-12 |
-| **Windows** (x86_64 MSVC) | VS Build Tools 2022（C++ 桌面开发 + CMake）；建议在 x64 Native Tools Prompt 运行 | `.\scripts\build.ps1` | `-NoGraph` 纯记忆版；`-Target` 交叉（MinGW 不推荐） |
+| **Windows** (x86_64 MSVC) | VS Build Tools 2019/2022 均可（C++ 桌面开发 + CMake）；脚本会自动补齐 VS 自带的 cmake/ninja | `.\scripts\build.ps1` | `-NoGraph` 纯记忆版；`-Target` 交叉（MinGW 不推荐）；graph 版**必须 release**（见下注） |
 
 CI：`.github/workflows/ci.yml` 在 macOS / Windows / Ubuntu 三平台 ×（graph / no-graph）
 六种组合上自动构建验证。纯记忆版（无 graph）为纯 Rust，无平台工具链要求。
 
 > kuzu 0.11.x 的 C++ 依赖使用 AVX-512 FP16 指令，Linux 下 GCC 11 及以下无法编译；
 > macOS 的 Apple clang 与 Windows 的 MSVC 不受此限制。
+
+> **Windows graph 版必须 `--release`**：debug 模式下 kuzu 的 C++ 静态库约 4 GB，rustc 会将其
+> 整体打包进 rlib（static 原生库默认 +bundle），归档超过 ar 格式 32 位偏移的 4 GiB 上限后符号
+> 表损坏，链接期报大量“无法解析的外部符号”（MSVC link.exe）或 malformed archive（lld-link）；
+> release 的 kuzu.lib 约 1 GB 不受影响，CI 与 build.ps1 均走 release。
 
 ## 运行
 
