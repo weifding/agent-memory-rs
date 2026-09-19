@@ -2,10 +2,11 @@
 
 use anyhow::Result;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListResourcesResult,
-    ListResourceTemplatesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
-    ResultType, ServerCapabilities, ServerInfo, TextContent, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CacheScope, ContentBlock,
+    ListResourcesResult, ListResourceTemplatesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceTemplate, ResultType, ServerCapabilities, ServerInfo, TextContent,
+    Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -185,13 +186,17 @@ impl ServerHandler for MemoryHandler {
             ]);
         }
 
+        // SEP-2549：协议 2026-07-28+ 的客户端（如 ZCode discover 生命周期）把
+        // ttlMs/cacheScope 当必填字段做 Zod 严格校验，缺失会导致整个 tools/list
+        // 结果被拒收（老协议客户端不认识这两个字段，rmcp 会在服务层为老 peer 剥掉）。
+        // 工具清单进程内静态，5 分钟 TTL 足够新鲜；Private = 仅同授权上下文可缓存。
         Ok(ListToolsResult {
             tools,
             next_cursor: None,
             result_type: Some(ResultType::COMPLETE),
             meta: None,
-            ttl_ms: None,
-            cache_scope: None,
+            ttl_ms: Some(300_000),
+            cache_scope: Some(CacheScope::Private),
         })
     }
 
@@ -211,8 +216,8 @@ impl ServerHandler for MemoryHandler {
             next_cursor: None,
             result_type: Some(ResultType::COMPLETE),
             meta: None,
-            ttl_ms: None,
-            cache_scope: None,
+            ttl_ms: Some(300_000),
+            cache_scope: Some(CacheScope::Private),
         })
     }
 
@@ -231,8 +236,8 @@ impl ServerHandler for MemoryHandler {
             next_cursor: None,
             result_type: Some(ResultType::COMPLETE),
             meta: None,
-            ttl_ms: None,
-            cache_scope: None,
+            ttl_ms: Some(300_000),
+            cache_scope: Some(CacheScope::Private),
         })
     }
 

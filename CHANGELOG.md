@@ -1,5 +1,37 @@
 # 修改记录（agent-memory-rs）
 
+## 2026-09-19 — 修复 discover 生命周期 tools/list 被 Zod 拒收（ttlMs/cacheScope 缺失）
+
+### 现象
+
+ZCode 2026-07-28 discover 生命周期的会话挂载失败：`initialize`/请求本身正常，
+`tools/list` 返回被客户端 Zod schema 整单拒收（`Invalid result for tools/list`），
+错误 path 为 `ttlMs`（expected number, received undefined）与 `cacheScope`
+（expected "public"|"private"）。四个工作区会话同样失败；走 initialize
+老生命周期的其他 agent 客户端不受影响。
+
+### 根因
+
+SEP-2549：协议 2026-07-28 起，分页列表结果（tools/list 等）的 `ttlMs`、
+`cacheScope` 为**必填**字段。rmcp `paginated_result!` 宏里两者是
+`Option` + `skip_serializing_if`，服务端构造时设 `None` → 字段整体缺失；
+新协议客户端严格校验必填 → 拒收。老协议 schema 无此字段（passthrough 容忍）→ 无感。
+
+### 修复
+
+1. `src/server.rs`：`list_tools` / `list_resources` / `list_resource_templates`
+   补 `ttl_ms: Some(300_000)`、`cache_scope: Some(CacheScope::Private)`。
+2. `vendor/rmcp`（延续已有补丁）：`strip_result_type_for_legacy_peer` 扩展为
+   对老协议 peer 同时剥掉列表结果的 `ttlMs`/`cacheScope`（这两个字段仅在
+   2026-07-28+ 定义）——老协议响应与修复前逐字节一致，其他 agent 零影响。
+
+### 验证（HTTP 实测双路径）
+
+- discover 生命周期（`_meta` 内联 2026-07-28 + `MCP-Protocol-Version`/
+  `MCP-Method` 头）：tools/list 返回 `ttlMs:300000, cacheScope:"private",
+  resultType:"complete"`，严格校验 PASS；resources/list 同；tools/call 冒烟通过。
+- 老协议（initialize 2025-06-18）：tools/list 顶层仅 `tools` 键，无新增字段 PASS。
+
 ## 2026-09-18 — Embedding 自动检测与真实向量接入
 
 ### 背景

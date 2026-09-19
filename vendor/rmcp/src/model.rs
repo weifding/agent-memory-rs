@@ -4580,7 +4580,9 @@ impl ServerResult {
     /// strict peers may reject it. Only the `"complete"` value is stripped:
     /// results whose discriminator carries meaning (`"input_required"`,
     /// `"task"`) are already gated to `2026-07-28`+ sessions, and custom
-    /// extension values are preserved.
+    /// extension values are preserved. The SEP-2549 cache hints (`ttlMs`,
+    /// `cacheScope`) on list results are likewise stripped, since those
+    /// fields are only defined for `2026-07-28`+ peers.
     ///
     /// # Examples
     ///
@@ -4594,18 +4596,33 @@ impl ServerResult {
     /// assert!(json.get("resultType").is_none());
     /// ```
     pub fn strip_result_type_for_legacy_peer(&mut self) {
-        let result_type = match self {
-            ServerResult::CompleteResult(r) => &mut r.result_type,
-            ServerResult::GetPromptResult(r) => &mut r.result_type,
-            ServerResult::ListPromptsResult(r) => &mut r.result_type,
-            ServerResult::ListResourcesResult(r) => &mut r.result_type,
-            ServerResult::ListResourceTemplatesResult(r) => &mut r.result_type,
-            ServerResult::ReadResourceResult(r) => &mut r.result_type,
-            ServerResult::ListToolsResult(r) => &mut r.result_type,
-            ServerResult::CallToolResult(r) => &mut r.result_type,
+        // SEP-2549: list results carry `ttlMs`/`cacheScope`, which are only
+        // defined for protocol version 2026-07-28+; legacy peers get the
+        // wire shape without them (and without `resultType: "complete"`).
+        let (result_type, cache_hints) = match self {
+            ServerResult::CompleteResult(r) => (&mut r.result_type, None),
+            ServerResult::GetPromptResult(r) => (&mut r.result_type, None),
+            ServerResult::ReadResourceResult(r) => (&mut r.result_type, None),
+            ServerResult::CallToolResult(r) => (&mut r.result_type, None),
+            ServerResult::ListPromptsResult(r) => {
+                (&mut r.result_type, Some((&mut r.ttl_ms, &mut r.cache_scope)))
+            }
+            ServerResult::ListResourcesResult(r) => {
+                (&mut r.result_type, Some((&mut r.ttl_ms, &mut r.cache_scope)))
+            }
+            ServerResult::ListResourceTemplatesResult(r) => {
+                (&mut r.result_type, Some((&mut r.ttl_ms, &mut r.cache_scope)))
+            }
+            ServerResult::ListToolsResult(r) => {
+                (&mut r.result_type, Some((&mut r.ttl_ms, &mut r.cache_scope)))
+            }
             _ => return,
         };
         result_type.take_if(|result_type| result_type.is_complete());
+        if let Some((ttl_ms, cache_scope)) = cache_hints {
+            ttl_ms.take();
+            cache_scope.take();
+        }
     }
 }
 
