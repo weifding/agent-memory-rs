@@ -26,8 +26,11 @@ use crate::storage::SQLiteStorage;
 
 /// 自动探测端口：LM Studio 1234 / Ollama 11434 / vLLM 8000 / Xinference 9997 / llama.cpp 8080
 const DETECT_PORTS: [u16; 5] = [1234, 11434, 8000, 9997, 8080];
-/// 探测超时（本地回环，600ms 足够；5 个端口并发探测，总开销 ~1s）
+/// 探测超时（本地回环，600ms 足够；5 个端口并发探测，总开销 ~1s）。
+/// 仅用于 /models 发现：无服务时快速失败
 const DETECT_TIMEOUT: Duration = Duration::from_millis(600);
+/// 探测中的 embeddings 试算超时：模型可能处于冷加载（2B 级首次推理需数秒），放宽到 30s
+const PROBE_EMBED_TIMEOUT: Duration = Duration::from_secs(30);
 const EMBED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// kv_meta 中记录当前向量空间的键名
@@ -43,9 +46,34 @@ pub struct Detected {
     pub dimensions: usize,
 }
 
+/// 嵌入协议（由配置 `embedding.provider` 选择，新增协议即新增枚举值 + embed 分支）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// OpenAI 兼容 POST {base}/v1/embeddings {"model","input":[..]}
+    OpenAi,
+    /// Ollama 原生 POST {base}/api/embed {"model","input":[..]} → {"embeddings":[[..]]}
+    Ollama,
+}
+
+impl Protocol {
+    pub fn from_provider(p: &str) -> Self {
+        match p.trim().to_lowercase().as_str() {
+            "ollama" => Protocol::Ollama,
+            _ => Protocol::OpenAi, // openai 及其他兼容实现默认走 OpenAI 协议
+        }
+    }
+    pub fn space_prefix(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "openai",
+            Protocol::Ollama => "ollama",
+        }
+    }
+}
+
 pub struct EmbeddingClient {
     http: HttpClient,
-    base_url: String, // 形如 http://127.0.0.1:1234/v1，无尾斜杠
+    protocol: Protocol,
+    base_url: String, // 无尾斜杠；OpenAi 协议已含 /v1
     model: String,
     api_key: Option<String>,
     pub model_id: String,
@@ -53,10 +81,21 @@ pub struct EmbeddingClient {
 }
 
 impl EmbeddingClient {
-    pub fn new(base_url: String, model: String, api_key: Option<String>, dimensions: usize) -> Self {
+    pub fn new(
+        protocol: Protocol,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        dimensions: usize,
+    ) -> Self {
+        let mut base_url = base_url.trim_end_matches('/').to_string();
+        if protocol == Protocol::OpenAi && !base_url.ends_with("/v1") {
+            base_url.push_str("/v1");
+        }
         Self {
             http: Client::builder(TokioExecutor::new()).build_http::<HttpBody>(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            protocol,
+            base_url,
             model,
             api_key,
             model_id: String::new(),
@@ -64,13 +103,29 @@ impl EmbeddingClient {
         }
     }
 
-    /// 批量嵌入（OpenAI /v1/embeddings 协议），返回顺序与输入一致
+    /// 批量嵌入，返回顺序与输入一致（按协议分支，默认 30s 超时）
     pub async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_with_timeout(texts, EMBED_TIMEOUT).await
+    }
+
+    /// 带自定义超时的批量嵌入（存量重嵌等大批量场景用更长超时）
+    pub async fn embed_with_timeout(
+        &self,
+        texts: &[&str],
+        timeout: Duration,
+    ) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
+        match self.protocol {
+            Protocol::OpenAi => self.embed_openai(texts, timeout).await,
+            Protocol::Ollama => self.embed_ollama(texts, timeout).await,
+        }
+    }
+
+    async fn embed_openai(&self, texts: &[&str], timeout: Duration) -> Result<Vec<Vec<f32>>> {
         let resp = self
-            .post_json("/embeddings", json!({"model": self.model, "input": texts}), EMBED_TIMEOUT)
+            .post_json("/embeddings", json!({"model": self.model, "input": texts}), timeout)
             .await?;
         let v: Value = serde_json::from_str(&resp).context("embedding 响应非 JSON")?;
         let data = v
@@ -98,6 +153,30 @@ impl EmbeddingClient {
         }
         out.sort_by_key(|(i, _)| *i);
         Ok(out.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Ollama 原生批量接口 POST /api/embed {"model","input":[..]} → {"embeddings":[[..]]}
+    async fn embed_ollama(&self, texts: &[&str], timeout: Duration) -> Result<Vec<Vec<f32>>> {
+        let resp = self
+            .post_json("/api/embed", json!({"model": self.model, "input": texts}), timeout)
+            .await?;
+        let v: Value = serde_json::from_str(&resp).context("embedding 响应非 JSON")?;
+        let data = v
+            .get("embeddings")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| anyhow!("ollama 响应缺少 embeddings 数组: {}", truncate(&resp, 200)))?;
+        if data.len() != texts.len() {
+            return Err(anyhow!(
+                "embedding 返回条数不匹配: 期望 {} 实际 {}",
+                texts.len(),
+                data.len()
+            ));
+        }
+        Ok(data
+            .iter()
+            .filter_map(|emb| emb.as_array())
+            .map(|emb| emb.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+            .collect())
     }
 
     async fn post_json(&self, path: &str, body: Value, timeout: Duration) -> Result<String> {
@@ -168,11 +247,14 @@ pub async fn probe(base: &str) -> Option<Detected> {
         .collect();
     let model = pick_model(&ids)?;
 
-    let client = EmbeddingClient::new(base.to_string(), model.clone(), None, 0);
-    let embs = tokio::time::timeout(DETECT_TIMEOUT, client.embed(&["embedding probe"]))
-        .await
-        .ok()?
-        .ok()?;
+    let client = EmbeddingClient::new(Protocol::OpenAi, base.to_string(), model.clone(), None, 0);
+    let embs = tokio::time::timeout(
+        PROBE_EMBED_TIMEOUT,
+        client.embed_with_timeout(&["embedding probe"], PROBE_EMBED_TIMEOUT),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let dimensions = embs.into_iter().next()?.len();
     if !(16..=100_000).contains(&dimensions) {
         return None;
@@ -253,16 +335,68 @@ pub async fn setup(
         .unwrap_or(false);
 
     let client: Option<Arc<EmbeddingClient>> = if explicit {
-        // 显式配置直接采用，不探测（配置错误在使用时报错，便于定位）
+        // 显式配置直接采用，不探测（配置错误在使用时报错，便于定位）；
+        // provider 决定协议：openai（默认，兼容实现均走此协议）/ ollama（原生 /api/embed）
+        let protocol = Protocol::from_provider(config.embedding.provider.as_deref().unwrap_or(""));
         let dim = config.embedding.dimensions.max(1) as usize;
+        let base = match protocol {
+            // Ollama 原生协议：地址/模型缺省时给本地默认值（用户显式配置优先）
+            Protocol::Ollama => {
+                let u = config.embedding.base_url.trim().trim_end_matches('/').to_string();
+                if u.is_empty() || u.contains("api.openai.com") {
+                    "http://127.0.0.1:11434".to_string()
+                } else {
+                    u
+                }
+            }
+            Protocol::OpenAi => normalize_base(&config.embedding.base_url),
+        };
+        // Ollama 模型未显式指定时（仍是 OpenAI 默认值），从 /api/tags 按 pick_model 挑选
+        let mut model = config.embedding.model.clone();
+        if protocol == Protocol::Ollama
+            && (model.is_empty() || model == "text-embedding-3-small")
+        {
+            let http: HttpClient = Client::builder(TokioExecutor::new()).build_http::<HttpBody>();
+            let tags = get_json(&http, &format!("{base}/api/tags")).await.unwrap_or_default();
+            let ids: Vec<String> = serde_json::from_str::<Value>(&tags)
+                .ok()
+                .and_then(|v| {
+                    v.get("models")?.as_array().map(|a| {
+                        a.iter()
+                            .filter_map(|m| m.get("name")?.as_str().map(String::from))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            if let Some(picked) = pick_model(&ids).or_else(|| ids.first().cloned()) {
+                model = picked;
+                config.embedding.model = model.clone();
+            }
+        }
+        // Ollama 维度未显式指定时（仍为默认 1536），试算一条测出真实维度
+        let mut dim = dim;
+        if protocol == Protocol::Ollama && config.embedding.dimensions == 1536 {
+            let probe_c = EmbeddingClient::new(protocol, base.clone(), model.clone(), None, 0);
+            if let Ok(embs) = probe_c
+                .embed_with_timeout(&["dimension probe"], PROBE_EMBED_TIMEOUT)
+                .await
+            {
+                if let Some(v) = embs.first() {
+                    dim = v.len();
+                    config.embedding.dimensions = dim as i32;
+                }
+            }
+        }
         let c = EmbeddingClient::new(
-            normalize_base(&config.embedding.base_url),
-            config.embedding.model.clone(),
+            protocol,
+            base,
+            model,
             config.embedding.api_key.clone(),
             dim,
         );
         tracing::info!(
             target: "embedding",
+            protocol = ?protocol,
             base_url = %c.base_url,
             model = %c.model,
             dimensions = dim,
@@ -302,6 +436,7 @@ pub async fn setup(
                 config.embedding.model = d.model.clone();
                 config.embedding.dimensions = d.dimensions as i32;
                 Some(Arc::new(EmbeddingClient::new(
+                    Protocol::OpenAi,
                     d.base_url,
                     d.model,
                     config.embedding.api_key.clone(),
@@ -318,33 +453,44 @@ pub async fn setup(
         }
     };
 
-    // 向量空间一致性：提供方或维度变化 → 重嵌全部存量记忆，保证新旧向量可比
+    // 向量空间一致性：提供方或维度变化 → 重嵌全部存量记忆，保证新旧向量可比。
+    // 重嵌失败不阻断启动（服务可用，向量处于混合空间），下次重启自动重试
     let space = match &client {
-        Some(c) => format!("openai:{}@{}", c.model, c.dimensions),
+        Some(c) => format!("{}:{}@{}", c.protocol.space_prefix(), c.model, c.dimensions),
         None => format!("pseudo-bigram@{}", storage.embedding_dim()),
     };
     if storage.get_meta(META_EMBEDDING_SPACE)?.as_deref() != Some(space.as_str()) {
-        let n = reembed_all(storage, client.as_deref()).await?;
-        storage.set_meta(META_EMBEDDING_SPACE, &space)?;
-        tracing::info!(target: "embedding", reembedded = n, space = %space, "向量空间变化：存量记忆已重嵌");
+        match reembed_all(storage, client.as_deref()).await {
+            Ok(n) => {
+                storage.set_meta(META_EMBEDDING_SPACE, &space)?;
+                tracing::info!(target: "embedding", reembedded = n, space = %space, "向量空间变化：存量记忆已重嵌");
+            }
+            Err(e) => {
+                tracing::error!(target: "embedding", error = %e, space = %space,
+                    "存量记忆重嵌失败（不影响启动）；向量处于混合空间，下次重启将自动重试");
+            }
+        }
     }
 
     Ok(client)
 }
 
-/// 重嵌全部存量记忆（client 为 None 时用伪嵌入，用于回退路径的空间归一）
+/// 重嵌全部存量记忆（client 为 None 时用伪嵌入，用于回退路径的空间归一）。
+/// 小批量 + 长超时：2B 级模型首次推理慢，单请求 500 条会超时
 async fn reembed_all(storage: &SQLiteStorage, client: Option<&EmbeddingClient>) -> Result<usize> {
+    const BATCH: i32 = 32;
+    const BATCH_TIMEOUT: Duration = Duration::from_secs(600);
     let mut offset = 0i32;
     let mut done = 0usize;
     loop {
-        let batch = storage.list_filtered(None, None, 500, offset)?;
+        let batch = storage.list_filtered(None, None, BATCH, offset)?;
         if batch.is_empty() {
             break;
         }
-        offset += 500;
+        offset += BATCH;
         if let Some(c) = client {
             let texts: Vec<&str> = batch.iter().map(|m| m.content.as_str()).collect();
-            let embs = c.embed(&texts).await?;
+            let embs = c.embed_with_timeout(&texts, BATCH_TIMEOUT).await?;
             for (m, e) in batch.iter().zip(embs) {
                 storage.update_embedding(&m.id, &e)?;
             }

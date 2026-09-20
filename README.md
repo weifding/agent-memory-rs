@@ -139,48 +139,33 @@ embedding:
 > （如 `caddy reverse-proxy --reverse-from 127.0.0.1:1234 to api.siliconflow.cn`），
 > 再按方式三指向反代地址。
 
-### 如何增加额外的嵌入语义计算功能（扩展指南）
+### 如何增加额外的嵌入语义计算功能（配置文件模式）
 
-**方式 A：零代码接入（推荐先试）**——任何提供 OpenAI 兼容 `POST /v1/embeddings`
-接口的服务都能直接插：云 API 走反代、自建推理（`infinity`、`text-embeddings-inference`）
-起在本地端口即可被探测或显式配置命中，模型挑选规则见 `pick_model()`
-（名称含 `embed`/`bge`/`gte`/`e5`/`wemm` 优先）。
+**提供方选择完全由配置文件驱动**，内置两种协议，新增接入点无需改代码：
 
-**方式 B：新增一种协议/提供方（改代码）**——例如 Ollama 原生 `/api/embeddings`、
-某云 SDK、或内嵌本地模型（fastembed/candle）：
+**方式 A：OpenAI 兼容服务（`provider: openai`，默认协议）**——任何提供
+`POST /v1/embeddings` 的服务都能配置接入：云 API 走本地反代、自建推理
+（`infinity`、`text-embeddings-inference`）或 LM Studio / vLLM 等。
+模型挑选规则（自动探测时）见 `pick_model()`：名称含 `embed`/`bge`/`gte`/`e5`/`wemm` 优先。
 
-1. **抽象提供方接口**（当前 `EmbeddingClient` 为具体类型，建议先抽出 trait）：
+**方式 B：Ollama 原生协议（`provider: ollama`）**——走 Ollama 自己的
+`POST /api/embed {"model","input":[..]}` 批量接口（不再经由其 OpenAI 兼容层）：
 
-   ```rust
-   // src/embedding.rs
-   #[async_trait::async_trait]
-   pub trait EmbeddingProvider: Send + Sync {
-       async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
-       fn dimensions(&self) -> usize;
-       /// 向量空间标识，格式 "<provider>:<model>@<dim>"，变化即触发全量重嵌
-       fn space_id(&self) -> String;
-   }
-   ```
+```yaml
+embedding:
+  provider: ollama        # 选择原生协议，跳过自动探测
+  base_url: http://127.0.0.1:11434   # 留空则默认 http://127.0.0.1:11434（不补 /v1）
+  model: bge-m3
+  dimensions: 1024        # 必须与模型真实输出一致
+```
 
-   让现有 `EmbeddingClient` 实现该 trait（`space_id` 即现在的
-   `openai:{model}@{dim}`），`MemoryHandler.embedding` 字段类型改为
-   `Option<Arc<dyn EmbeddingProvider>>`——`embed_text()` 调用点无需改动。
+环境变量等价：`AGENT_MEMORY_EMBEDDING__PROVIDER=ollama`。
 
-2. **实现新提供方**：新建结构体实现 `embed()`，例如 Ollama 原生协议
-   `POST /api/embeddings {"model":..., "prompt":...}` → 解析 `embedding` 字段；
-   批量接口则一次传多文本并按 `index` 还原顺序（参照 `EmbeddingClient::embed`）。
-   关键约定：**真实提供方请求失败必须返回 Err**——上层会报错而不是静默落伪嵌入向量，
-   防止污染向量空间。
+两种方式共用同一套向量空间机制：空间标识分别为 `openai:<model>@<dim>` /
+`ollama:<model>@<dim>`，在 openai/ollama/伪嵌入之间切换配置并重启，存量记忆自动重嵌。
 
-3. **接入装配**：`embedding::setup()` 里按 `config.embedding.provider` 分支构造
-   （如 `provider = "ollama"` 时构造 `OllamaProvider`，并跳过 OpenAI 探测）；
-   `space_id` 用新前缀（如 `ollama:{model}@{dim}`），首次启用即自动重嵌存量。
-
-4. **配置与文档**：`config.rs` 的 `EmbeddingConfig` 如需新字段（如专属端口）在此加；
-   同时更新本节和 `AGENTS.md`（双实现同步约束）。
-
-5. **验证**：启动后看日志 `embedding provider: 使用显式配置` / `向量空间变化：存量记忆已重嵌`；
-   存一条 → `search_memory` 语义查询应命中；换回原提供方确认重嵌链路无报错。
+**仅当目标服务使用全新协议时才需要改代码**（在 `embedding.rs` 的 `Protocol` 枚举加变体、
+`embed()` 加一个分支、`from_provider()` 加映射，约 30 行），随后同样回到配置文件模式使用。
 
 > 维度一致性是硬约束：`embedding.dimensions` 必须等于模型真实输出，混用维度会导致
 > 余弦相似度失真（向量空间机制会在切换时重嵌兜底，但同空间内维度不一致无法自愈）。
