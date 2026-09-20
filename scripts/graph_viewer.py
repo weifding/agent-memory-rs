@@ -79,6 +79,36 @@ def q(cypher):
     return call_tool("graph_query", {"cypher": cypher}).get("results", [])
 
 
+def entity_memories(label, name):
+    """实体的全部关联记忆（含全文）。"""
+    ids = call_tool("graph_get_related_memories",
+                    {"label": label, "name": name}).get("memory_ids", [])
+    mems = []
+    for mid in ids:
+        try:
+            mems.append(call_tool("get_memory", {"memory_id": mid}))
+        except Exception:  # noqa: BLE001
+            mems.append({"id": mid, "content": "（读取失败）"})
+    mems.sort(key=lambda m: m.get("created_at") or "", reverse=True)
+    return {"label": label, "name": name, "memories": mems}
+
+
+def memory_context(memory_id):
+    """单条记忆全文 + 反向挂载它的实体列表。"""
+    try:
+        mem = call_tool("get_memory", {"memory_id": memory_id})
+    except Exception:  # noqa: BLE001
+        mem = {"id": memory_id, "content": "（读取失败）"}
+    parents = []
+    for rel, src, dst, _skey, _dkey in RELATIONS:
+        if dst != "MemoryRef":
+            continue
+        for row in q(f"MATCH (a:{src})-[r:{rel}]->(m:MemoryRef {{memory_id:'{memory_id}'}}) "
+                     "RETURN a.name AS name"):
+            parents.append({"label": src, "name": row["name"], "rel": rel})
+    return {"memory": mem, "parents": parents}
+
+
 # ---------------------------------------------------------------- 数据组装
 
 def build_graph():
@@ -131,12 +161,22 @@ PAGE = r"""<!DOCTYPE html>
   #meta { margin-left:auto; font-size:11px; color:#8b96ab; }
   #refresh { background:#2a3550; color:#dde3ee; border:0; border-radius:6px; padding:5px 12px; cursor:pointer; }
   #stage { position:fixed; top:44px; left:0; right:0; bottom:0; cursor:grab; user-select:none; -webkit-user-select:none; }
-  #panel { position:fixed; right:0; top:44px; bottom:0; width:340px; background:#161d2eee;
-           border-left:1px solid #2a3550; padding:14px; overflow:auto; display:none; }
-  #panel h3 { margin:4px 0 8px; font-size:14px; }
-  #panel .tag { font-size:11px; padding:2px 8px; border-radius:10px; background:#2a3550; }
-  #panel pre { white-space:pre-wrap; word-break:break-all; font-size:12px; line-height:1.6;
-               color:#c3cbdc; font-family:inherit; }
+  #panel { position:fixed; right:0; top:44px; bottom:0; width:360px; background:#161d2eee;
+           border-left:1px solid #2a3550; padding:12px; overflow:auto; }
+  #p-head { font-size:13px; font-weight:600; margin-bottom:4px; }
+  #p-sub { font-size:11px; color:#8b96ab; margin-bottom:10px; }
+  .ent { font-size:12px; margin:2px 0 8px; }
+  .mem { border:1px solid #232e48; border-radius:8px; margin:6px 0; background:#121828; overflow:hidden; }
+  .mem-h { padding:7px 9px; cursor:pointer; }
+  .mem-h:hover { background:#1a2238; }
+  .mem-h .prev { font-size:12px; color:#c3cbdc; }
+  .mem-h .meta { font-size:10px; color:#7f8aa3; margin-top:3px; }
+  .mem .full { display:none; white-space:pre-wrap; word-break:break-all; font-size:11.5px;
+               line-height:1.65; color:#b9c2d4; padding:2px 10px 10px; border-top:1px dashed #232e48;
+               font-family:inherit; margin:0; }
+  .mem.open .full { display:block; }
+  .mem.open .mem-h { background:#1a2238; }
+  .cat { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
   #tip { position:fixed; pointer-events:none; background:#1d2740; border:1px solid #35426b;
          padding:6px 10px; border-radius:6px; font-size:12px; max-width:320px; display:none; z-index:20; }
 </style>
@@ -150,7 +190,11 @@ PAGE = r"""<!DOCTYPE html>
   <button id="refresh">刷新数据</button>
 </div>
 <svg id="stage"></svg>
-<div id="panel"></div>
+<div id="panel">
+  <div id="p-head">记忆树</div>
+  <div id="p-sub">点击图谱中的实体节点，查看其关联的全部记忆</div>
+  <div id="p-body"></div>
+</div>
 <div id="tip"></div>
 <script>
 const COLORS = __COLORS__;
@@ -158,11 +202,18 @@ const svg = document.getElementById('stage'), panel = document.getElementById('p
       tip = document.getElementById('tip'), meta = document.getElementById('meta');
 let nodes = [], links = [], hidden = new Set(), query = '';
 let W = innerWidth, H = innerHeight - 44;
-let view = {k: 1, x: 0, y: 0};
+const PANEL_W = 360;                 // 右侧记忆树面板宽度，布局中心避开它
+let view = {k: 1, x: -PANEL_W / 2, y: 0};
+let selId = null;
 
 function resize() { W = innerWidth; H = innerHeight - 44;
   svg.setAttribute('width', W); svg.setAttribute('height', H); }
 addEventListener('resize', resize); resize();
+
+const CAT_COLORS = {knowledge:'#4C8DFF', fact:'#35B37E', episode:'#E8A33D',
+                    preference:'#9B6DE8', procedure:'#3DC9C9', user_profile:'#FF8FB1'};
+const catColor = c => CAT_COLORS[c] || '#7f8aa3';
+const esc = s => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
 // 图例
 const lgBox = document.getElementById('legend');
@@ -182,7 +233,6 @@ async function load() {
   links = d.links.filter(l => idx[l.source] && idx[l.target])
                  .map(l => ({s: idx[l.source], t: idx[l.target], rel: l.rel}));
   meta.textContent = `${nodes.length} 节点 · ${links.length} 边`;
-  panel.style.display = 'none';
   for (let i = 0; i < 260; i++) step();
   draw();
 }
@@ -203,9 +253,9 @@ function step() {
     l.s.vx += dx/d*f; l.s.vy += dy/d*f; l.t.vx -= dx/d*f; l.t.vy -= dy/d*f;
   }
   for (const n of nodes) {
-    n.vx += (W/2 - n.x) * 0.0035; n.vy += (H/2 - n.y) * 0.0035;
+    n.vx += ((W - PANEL_W) / 2 - n.x) * 0.0035; n.vy += (H/2 - n.y) * 0.0035;
     n.vx *= .82; n.vy *= .82; n.x += n.vx; n.y += n.vy;
-    n.x = Math.max(30, Math.min(W-30, n.x)); n.y = Math.max(30, Math.min(H-30, n.y));
+    n.x = Math.max(30, Math.min(W - PANEL_W - 30, n.x)); n.y = Math.max(30, Math.min(H-30, n.y));
   }
 }
 
@@ -226,10 +276,11 @@ function draw() {
     const [x,y] = Z([n.x,n.y]);
     const r = n.type==='MemoryRef' ? 5*view.k : 9*view.k;
     const c = COLORS[n.type] || '#888';
-    out += `<circle cx="${x}" cy="${y}" r="${r}" fill="${c}" data-id="${n.id}" `+
+    const stroke = n.id === selId ? ' stroke="#fff" stroke-width="2"' : '';
+    out += `<circle cx="${x}" cy="${y}" r="${r}" fill="${c}"${stroke} data-id="${n.id}" `+
            `style="cursor:pointer"><title>${n.type}:${n.name}\n${(n.preview||'').slice(0,120)}</title></circle>`;
     if (n.type !== 'MemoryRef')
-      out += `<text x="${x}" y="${y + r + 11}" text-anchor="middle" font-size="${10*view.k}" fill="#9aa5ba">${n.name}</text>`;
+      out += `<text x="${x}" y="${y + r + 11}" text-anchor="middle" font-size="${10*view.k}" fill="#9aa5ba">${esc(n.name)}</text>`;
   }
   svg.innerHTML = out;
 }
@@ -245,7 +296,8 @@ svg.addEventListener('click', e => {
   if (!id || !downPos) return;
   if (Math.hypot(e.clientX - downPos[0], e.clientY - downPos[1]) > 5) return;
   const n = nodes.find(v => v.id === id);
-  if (n) openNode(n);
+  if (!n) return;
+  n.type === 'MemoryRef' ? openMemory(n) : openEntity(n);
 });
 svg.addEventListener('mouseover', e => {
   const id = e.target.dataset && e.target.dataset.id;
@@ -265,21 +317,49 @@ svg.addEventListener('mouseout', e => {
   if (e.target.dataset && e.target.dataset.id) tip.style.display = 'none';
 });
 
-// 点击节点 → 侧栏
-async function openNode(n) {
-  panel.style.display = 'block';
-  if (n.type === 'MemoryRef') {
-    panel.innerHTML = `<span class="tag">MemoryRef</span> <b>${n.name}</b><pre>加载中…</pre>`;
-    try {
-      const m = await (await fetch('/api/memory/' + (n.mid || n.name))).json();
-      panel.innerHTML = `<span class="tag">MemoryRef</span> <b>${n.name}</b>
-        <div style="font-size:11px;color:#8b96ab;margin:6px 0">${m.category||''} · ${m.namespace||''} · importance ${m.importance??''}</div>
-        <pre>${(m.content||'').replace(/</g,'&lt;')}</pre>`;
-    } catch(e) { panel.innerHTML += '<pre>读取失败</pre>'; }
-  } else {
-    panel.innerHTML = `<span class="tag" style="background:${COLORS[n.type]}22;color:${COLORS[n.type]}">${n.type}</span> <b>${n.name}</b>
-      <pre>${n.preview||'（图谱实体节点）'}</pre>`;
-  }
+// 点击节点 → 右侧记忆树
+const pHead = document.getElementById('p-head'), pSub = document.getElementById('p-sub'),
+      pBody = document.getElementById('p-body');
+
+function memCard(m) {
+  const prev = (m.content || '').slice(0, 60).replace(/\\n/g, ' ');
+  const full = esc(m.content || '');
+  return `<div class="mem"><div class="mem-h" onclick="this.parentNode.classList.toggle('open')">
+    <div class="prev"><span class="cat" style="background:${catColor(m.category)}"></span>${esc(prev)}…</div>
+    <div class="meta">${esc(m.category || '')} · ${esc(m.namespace || '')} · importance ${m.importance ?? '-'} · ${(m.created_at || '').slice(0, 10)}</div>
+  </div><div class="full">${full}</div></div>`;
+}
+
+async function openEntity(n) {
+  selId = n.id; draw();
+  pHead.innerHTML = `<span style="color:${COLORS[n.type]}">●</span> ${esc(n.name)}`;
+  pSub.textContent = `${n.type} · 正在加载关联记忆…`;
+  pBody.innerHTML = '';
+  try {
+    const d = await (await fetch('/api/entity_memories?label=' + encodeURIComponent(n.type)
+                                + '&name=' + encodeURIComponent(n.name))).json();
+    pSub.textContent = `${n.type} · ${d.memories.length} 条关联记忆（点击展开全文）`;
+    pBody.innerHTML = d.memories.length
+      ? d.memories.map(memCard).join('')
+      : '<div style="font-size:12px;color:#7f8aa3">（无关联记忆）</div>';
+  } catch (e) { pSub.textContent = '加载失败：' + e; }
+}
+
+async function openMemory(n) {
+  selId = n.id; draw();
+  pHead.innerHTML = `<span style="color:${COLORS.MemoryRef}">●</span> 记忆 ${esc(n.name)}`;
+  pSub.textContent = '加载中…';
+  pBody.innerHTML = '';
+  try {
+    const d = await (await fetch('/api/memory_context/' + (n.mid || n.name))).json();
+    const m = d.memory || {};
+    pSub.textContent = (d.parents.length
+      ? '挂在：' + d.parents.map(p => `${p.label}:${p.name}`).join('、')
+      : '（未挂载到任何实体）');
+    pBody.innerHTML = memCard(m);
+    const card = pBody.querySelector('.mem');
+    if (card) card.classList.add('open');
+  } catch (e) { pSub.textContent = '加载失败：' + e; }
 }
 
 // 搜索 & 缩放拖拽
@@ -327,6 +407,25 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(build_graph(), ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                self._send(502, "application/json; charset=utf-8",
+                           json.dumps({"error": str(e)}))
+        elif self.path.startswith("/api/entity_memories"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            label = (qs.get("label") or [""])[0]
+            name = (qs.get("name") or [""])[0]
+            try:
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(entity_memories(label, name), ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                self._send(502, "application/json; charset=utf-8",
+                           json.dumps({"error": str(e)}))
+        elif self.path.startswith("/api/memory_context/"):
+            mid = self.path.rsplit("/", 1)[1]
+            try:
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(memory_context(mid), ensure_ascii=False))
             except Exception as e:  # noqa: BLE001
                 self._send(502, "application/json; charset=utf-8",
                            json.dumps({"error": str(e)}))
