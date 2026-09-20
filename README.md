@@ -170,6 +170,56 @@ embedding:
 > 维度一致性是硬约束：`embedding.dimensions` 必须等于模型真实输出，混用维度会导致
 > 余弦相似度失真（向量空间机制会在切换时重嵌兜底，但同空间内维度不一致无法自愈）。
 
+### 实战案例：接入微信 WeMM-Embedding-2B（2026-09-20）
+
+一次完整的真实嵌入接入记录，可作为同流程的参考模板。
+
+**目标模型**：[WeMM-Embedding-2B](https://github.com/) —— 腾讯微信视觉团队 2026-08 开源的
+多模态嵌入模型（Qwen3.5 底座，文本输入输出 2048 维 L2 归一化向量）。
+
+**步骤（共三步）**：
+
+```bash
+# 1. 启动 Ollama 服务（brew 安装，launchd 常驻）
+brew install ollama && brew services start ollama
+
+# 2. 拉取模型（1.6GB）
+ollama pull milkey/wemm-embedding-2b
+
+# 3. 完成。无需任何配置 —— 重启记忆服务，自动探测命中：
+#    INFO embedding: embedding 服务器自动检测成功
+#      base_url=http://127.0.0.1:11434/v1 model=milkey/wemm-embedding-2b:latest dimensions=2048
+#    INFO embedding: 存量重嵌进行中 done=32 → 64 → 75
+#    INFO embedding: 向量空间变化：存量记忆已重嵌 space=openai:milkey/wemm-embedding-2b:latest@2048
+```
+
+**效果对比**（伪嵌入 → 2048 维真实嵌入）：
+
+| 查询 | 命中（similarity） | 说明 |
+|---|---|---|
+| 「怎么管控孩子使用平板」 | 平板管控记忆（0.478） | **无任何关键词重叠**，纯语义命中；伪嵌入时代不可能 |
+| 「知识图谱可视化页面」 | 图谱查看器记忆（0.537） | 同上 |
+
+**过程中发现并修复的三个问题**（均已合入，复现此流程不会再遇到）：
+
+1. **探测冷加载误判**：探测的 embeddings 试算超时原为 600ms，而 2B 模型冷加载首次推理
+   需数秒 → 探测误判"未检测到"回退伪嵌入。修复：`/models` 发现保持 600ms 快失败，
+   命中服务后的试算放宽到 30s（`PROBE_EMBED_TIMEOUT`）。
+2. **重嵌超时导致崩溃循环**：存量重嵌原为 500 条/请求 + 30s 超时，2B 模型扛不住 →
+   setup 失败 → launchd 反复重启。修复：32 条/批 + 600s 超时；失败仅告警不阻断启动，
+   下次重启自动重试（重试到成功才更新空间标记）。
+3. **launchd 拉起卡死在 dyld open()**：从外置盘（/Volumes/...）启动二进制时，launchd
+   拉起进程反复卡死在动态链接阶段（手动终端运行完全正常，采样定格在 `dyld3::open`）。
+   根治：二进制部署到本地盘 `~/.agent-memory/bin/`，plist 指向该路径。
+   **注意：改 plist 后必须 `launchctl unload + load`，仅 `kickstart` 用的还是旧任务定义。**
+
+**验证清单**（接入后建议逐项确认）：
+
+- [ ] 启动日志出现 `自动检测成功` 与 `存量记忆已重嵌`
+- [ ] `kv_meta` 表 `embedding_space` 已更新为新空间标识
+- [ ] 语义查询（换一种说法的目标内容）similarity ≥ 0.4 且命中预期
+- [ ] 新 `store_memory` 正常（自动使用真实嵌入），无 embedding 报错
+
 ## 性能基准
 
 测试环境：10000 条记忆数据，128 维向量，2000 条带向量。
