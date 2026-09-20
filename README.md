@@ -1,289 +1,352 @@
 # agent-memory-rs
 
-基于 Rust 重写的 MCP 外挂记忆体服务器，使用 SQLite + 可选 Kùzu 知识图谱作为存储后端。
+**Language: English | [中文](README.zh-CN.md)**
 
-## 功能
+A from-scratch Rust rewrite of the agent-memory MCP server, using SQLite plus an
+optional Kùzu knowledge graph as storage backends.
 
-- **记忆存储**：SQLite 持久化，支持 namespace、category、importance、entities、topics 等元数据
-- **向量检索**：纯 Rust 余弦相似度实现，支持 top-k 语义搜索
-- **Embedding 自动检测**：启动时并发探测本地 OpenAI 兼容 embedding 服务（LM Studio:1234 / Ollama:11434 / vLLM:8000 / Xinference:9997 / llama.cpp:8080，或 `EMBEDDING_BASE_URL` 指定），命中即自动配置 provider/model/维度并替换内置伪嵌入；向量空间变化时自动重嵌存量记忆。未检测到时回退字符 bigram 伪嵌入（零外部依赖），配置 `embedding.provider` 显式指定时跳过探测
-- **知识图谱**（可选）：Kùzu 嵌入式图数据库，支持实体/关系/多跳查询/按属性聚合
-- **记忆自动入图**（可选）：`store_memory` 时按内置/自定义词典 + 命名空间骨架自动抽取实体并生成图谱节点与 `*_MEMORY` 关联；启动时可对存量记忆幂等回填一次
-- **MCP 协议**：基于 rmcp 3.2，支持 stdio 与 HTTP（Streamable HTTP + SSE）两种传输，兼容 ZCode / Cursor / Claude Desktop 等 MCP 客户端
-- **HTTP 鉴权**：`server.auth_token` 配置 Bearer Token 中间件；绑定非回环地址（非 127.0.0.1）时必须设置，否则拒绝启动
-- **零外部依赖运行**：SQLite 内嵌（rusqlite bundled），单二进制部署
+## Features
 
-## 项目结构
+- **Memory storage**: SQLite persistence with namespace, category, importance,
+  entities, topics and other metadata
+- **Vector search**: pure-Rust cosine similarity with top-k semantic search
+- **Embedding auto-detection**: at startup the server concurrently probes local
+  OpenAI-compatible embedding services (LM Studio:1234 / Ollama:11434 /
+  vLLM:8000 / Xinference:9997 / llama.cpp:8080, or `EMBEDDING_BASE_URL`), and on
+  a hit automatically fills in provider/model/dimensions, replacing the built-in
+  pseudo-embedding. When the vector space changes, all existing memories are
+  re-embedded automatically. If nothing is detected it falls back to the built-in
+  character-bigram pseudo embedding (zero external dependencies); setting
+  `embedding.provider` explicitly skips probing
+- **Knowledge graph** (optional): Kùzu embedded graph database with entity /
+  relation / multi-hop query / property aggregation
+- **Memories auto-linked into the graph** (optional): on `store_memory`, entities
+  are extracted via the built-in/custom dictionary plus namespace skeleton and
+  graph nodes with `*_MEMORY` edges are created; on startup existing memories are
+  back-filled idempotently once
+- **MCP protocol**: based on rmcp 3.2 with both stdio and HTTP (Streamable HTTP +
+  SSE) transports; compatible with ZCode / Cursor / Claude Desktop and other MCP clients
+- **HTTP auth**: `server.auth_token` enables a Bearer-token middleware; required
+  when binding to a non-loopback address, otherwise startup is refused
+- **Zero runtime dependencies**: SQLite embedded (rusqlite bundled), single-binary deploy
+
+## Project structure
 
 ```
 src/
-├── lib.rs       # 库导出
-├── main.rs      # CLI 入口（stdio MCP server）
-├── config.rs    # 配置管理（YAML + env + clap）
-├── models.rs    # 数据模型（Memory / MemorySearchResult / MemoryStats）
-├── storage.rs   # SQLite 存储层 + 向量检索
-├── graph.rs     # Kùzu 图谱模块（feature = "graph"）
-└── server.rs    # MCP ServerHandler 实现
+├── lib.rs          # crate exports
+├── main.rs         # CLI entry (stdio / HTTP MCP server)
+├── config.rs       # configuration (YAML + env + clap)
+├── models.rs       # data models (Memory / MemorySearchResult / MemoryStats)
+├── storage.rs      # SQLite storage layer + vector search
+├── embedding.rs    # embedding providers (auto-detect / openai / ollama / pseudo)
+├── extract.rs      # rule-based entity extraction (dictionary + namespace skeleton)
+├── graph.rs        # Kùzu graph module (feature = "graph")
+└── server.rs       # MCP ServerHandler implementation
 examples/
-└── bench.rs     # 性能基准测试
+└── bench.rs        # performance benchmark
+scripts/
+├── build.sh        # macOS/Linux build entry
+├── build.ps1       # Windows (MSVC) build entry
+└── graph_viewer.py # web UI to browse the knowledge graph
 ```
 
-## 编译（跨平台开关）
+## Build (cross-platform switches)
 
-通用命令（三平台等价）：
+Universal commands (equivalent on all three platforms):
 
 ```bash
-cargo build --release                  # 基础版（无图谱）
-cargo build --release --features graph # 图谱版（kuzu，需平台工具链，见下表）
+cargo build --release                  # base version (no graph)
+cargo build --release --features graph # graph version (kuzu; needs per-OS toolchain, see table)
 ```
 
-构建期平台开关由 `build.rs` 自动检测：启用 graph feature 时逐平台检查工具链
-（cmake / CLT / GCC 版本 / MSVC 环境），缺失时在编译最早期打印 `cargo:warning`
-与安装指引，而不是掉进 cmake 深处的报错。
+Build-time platform switches are handled by `build.rs`: when the graph feature is
+enabled it checks the toolchain per target OS (cmake / CLT / GCC version / MSVC
+environment) and prints a `cargo:warning` with install instructions at the
+earliest stage — instead of failing deep inside cmake.
 
-| 平台 | graph 版工具链要求 | 一键脚本 | 备注 |
+| Platform | Toolchain for the graph build | One-shot script | Notes |
 |---|---|---|---|
-| **macOS** (arm64/x86_64) | Xcode CLT（`xcode-select --install`）+ cmake（`brew install cmake`）；Apple clang 可直接编译 kuzu，**无需 GCC 12** | `./scripts/build.sh` | `--no-graph` 纯记忆版；`--target` 交叉 |
-| **Linux** (x86_64/aarch64) | GCC >= 12（或 clang >= 16）+ cmake；glibc >= 2.28 | `./scripts/build.sh` | 老系统用 `--musl` 静态编译；CC/CXX 可指向 gcc-12 |
-| **Windows** (x86_64 MSVC) | VS Build Tools 2019/2022 均可（C++ 桌面开发 + CMake）；脚本会自动补齐 VS 自带的 cmake/ninja | `.\scripts\build.ps1` | `-NoGraph` 纯记忆版；`-Target` 交叉（MinGW 不推荐）；graph 版**必须 release**（见下注） |
+| **macOS** (arm64/x86_64) | Xcode CLT (`xcode-select --install`) + cmake (`brew install cmake`); Apple clang builds kuzu directly, **no GCC 12 needed** | `./scripts/build.sh` | `--no-graph` memory-only; `--target` for cross builds |
+| **Linux** (x86_64/aarch64) | GCC >= 12 (or clang >= 16) + cmake; glibc >= 2.28 | `./scripts/build.sh` | `--musl` for static linking on old distros; point CC/CXX at gcc-12 |
+| **Windows** (x86_64 MSVC) | VS Build Tools 2019/2022 (C++ desktop + CMake); the script adds VS-bundled cmake/ninja to PATH | `.\scripts\build.ps1` | `-NoGraph` memory-only; `-Target` for cross (MinGW not recommended); the graph build **requires `--release`** (see note below) |
 
-CI：`.github/workflows/ci.yml` 在 macOS / Windows / Ubuntu 三平台 ×（graph / no-graph）
-六种组合上自动构建验证。纯记忆版（无 graph）为纯 Rust，无平台工具链要求。
+CI: `.github/workflows/ci.yml` builds and verifies macOS / Windows / Ubuntu ×
+(graph / no-graph) — six combinations. The memory-only build (no graph) is pure
+Rust with no platform toolchain requirements.
 
-> kuzu 0.11.x 的 C++ 依赖使用 AVX-512 FP16 指令，Linux 下 GCC 11 及以下无法编译；
-> macOS 的 Apple clang 与 Windows 的 MSVC 不受此限制。
+> kuzu 0.11.x's C++ dependencies use AVX-512 FP16 instructions; GCC 11 and below
+> cannot compile it on Linux. Apple clang on macOS and MSVC on Windows are not
+> affected.
 
-> **Windows graph 版必须 `--release`**：debug 模式下 kuzu 的 C++ 静态库约 4 GB，rustc 会将其
-> 整体打包进 rlib（static 原生库默认 +bundle），归档超过 ar 格式 32 位偏移的 4 GiB 上限后符号
-> 表损坏，链接期报大量“无法解析的外部符号”（MSVC link.exe）或 malformed archive（lld-link）；
-> release 的 kuzu.lib 约 1 GB 不受影响，CI 与 build.ps1 均走 release。
+> **The Windows graph build must use `--release`**: in debug mode kuzu's C++
+> static library is ~4 GB and rustc packs it whole into the rlib (`+bundle` is
+> the default for static native libs); once the archive exceeds the 4 GiB limit
+> of ar's 32-bit offsets the symbol table corrupts and linking fails with masses
+> of "unresolved external symbol" (MSVC link.exe) or a malformed archive
+> (lld-link). Release kuzu.lib is ~1 GB and unaffected; CI and build.ps1 both use
+> release.
 
-## 运行
+## Run
 
 ```bash
-# stdio 模式（默认，由 MCP 客户端拉起）
+# stdio mode (default; spawned by the MCP client)
 ./target/release/agent-memory-server
 
-# HTTP 模式（常驻服务，端点为 POST http://<host>:<port>/mcp）
+# HTTP mode (resident service; endpoint is POST http://<host>:<port>/mcp)
 ./target/release/agent-memory-server --transport http --host 127.0.0.1 --port 8888
 
-# HTTP 对外暴露（必须设置 auth_token）
+# Expose HTTP publicly (auth_token is mandatory)
 AGENT_MEMORY_SERVER__AUTH_TOKEN=<secret> ./target/release/agent-memory-server --transport http --host 0.0.0.0 --port 8888
 
-# 指定配置文件
+# Custom config file
 ./target/release/agent-memory-server --config config.yaml
 
-# 查看帮助
+# Help
 ./target/release/agent-memory-server --help
 ```
 
-> 注意：stdio 模式直接在终端运行会立即退出（stdin 无 JSON-RPC 客户端），属正常行为。
-> HTTP 模式每个会话由 service_factory 创建独立 handler，存储与 Kùzu 图谱通过 `Arc` 共享，
-> 整个服务仍保持单进程单连接，符合 Kùzu 嵌入式单进程约束。
+> Note: running the stdio mode directly in a terminal exits immediately (no
+> JSON-RPC client on stdin) — that is expected. In HTTP mode each session gets
+> its own handler from the service factory while storage and the Kùzu graph are
+> shared via `Arc`; the service remains a single process with a single
+> connection, satisfying the Kùzu embedded single-process constraint.
 
-### macOS 常驻部署（launchd）
+### macOS resident deployment (launchd)
 
-安装 `~/Library/LaunchAgents/com.agent-memory.server.plist` 后：
+After installing `~/Library/LaunchAgents/com.agent-memory.server.plist`:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.agent-memory.server.plist   # 启动（开机自启、崩溃自动拉起）
-launchctl kickstart -k gui/$(id -u)/com.agent-memory.server           # 手动重启（更新二进制后执行）
-launchctl unload ~/Library/LaunchAgents/com.agent-memory.server.plist # 停止
-tail -f ~/.agent-memory/server.log                                    # 查看日志
+launchctl load ~/Library/LaunchAgents/com.agent-memory.server.plist   # start (auto-start at boot, restart on crash)
+launchctl kickstart -k gui/$(id -u)/com.agent-memory.server           # manual restart (run after updating the binary)
+launchctl unload ~/Library/LaunchAgents/com.agent-memory.server.plist # stop
+tail -f ~/.agent-memory/server.log                                    # logs
 ```
 
-plist 关键配置：`RunAtLoad` + `KeepAlive=true`，环境变量 `AGENT_MEMORY_GRAPH__ENABLED=true`，
-标准错误写入 `~/.agent-memory/server.log`。
+Key plist settings: `RunAtLoad` + `KeepAlive=true`, env
+`AGENT_MEMORY_GRAPH__ENABLED=true`, stderr goes to
+`~/.agent-memory/server.log`. Deploy the binary on a **local** disk (e.g.
+`~/.agent-memory/bin/`) — launchd-spawned processes may hang in `dyld open()`
+when the executable lives on an external volume; after editing the plist you
+must `launchctl unload + load` (`kickstart` alone keeps the old job definition).
 
-## 嵌入语义计算（Embedding）
+## Embedding
 
-### 工作原理
+### How it works
 
-`store_memory` / `search_memory` 写入与检索都依赖文本向量。服务按以下优先级选择嵌入来源
-（实现见 `src/embedding.rs`）：
+`store_memory` / `search_memory` both depend on text vectors. The server picks
+the embedding source by the following priority (see `src/embedding.rs`):
 
-1. **显式配置**：配置文件或环境变量设置了 `embedding.provider` → 直接采用，不做探测
-2. **自动探测**：启动时并发探测本机常见推理服务的 OpenAI 兼容端点
-   （LM Studio:1234 / Ollama:11434 / vLLM:8000 / Xinference:9997 / llama.cpp:8080，
-   或 `EMBEDDING_BASE_URL` 指定的地址），`GET /v1/models` 选模型 → `POST /v1/embeddings`
-   试算维度，命中即自动回填 provider/model/维度
-3. **伪嵌入回退**：都未命中时用内置字符 bigram 哈希嵌入（零外部依赖，字面相似度可用，
-   语义泛化弱）
+1. **Explicit config**: `embedding.provider` set in the config file or env →
+   used as-is, no probing
+2. **Auto-detection**: at startup the server concurrently probes local
+   OpenAI-compatible endpoints (LM Studio:1234 / Ollama:11434 / vLLM:8000 /
+   Xinference:9997 / llama.cpp:8080, or `EMBEDDING_BASE_URL`), picks a model via
+   `GET /v1/models` then measures dimensions with `POST /v1/embeddings`
+3. **Pseudo-embedding fallback**: if nothing is detected, a built-in character
+   bigram hash embedding is used (zero external dependencies; lexical similarity
+   works, semantic generalization is weak)
 
-**向量空间一致性**：当前空间以 `kv_meta.embedding_space` 记录
-（如 `openai:bge-m3@1024` 或 `pseudo-bigram@1536`）。提供方或维度变化时，启动阶段自动
-**重嵌全部存量记忆**，保证新旧向量可比；因此在有/无 embedding 服务之间切换无需手工迁移。
+**Vector-space consistency**: the current space is recorded in
+`kv_meta.embedding_space` (e.g. `openai:bge-m3@1024` or `pseudo-bigram@1536`).
+When the provider or dimensions change, all existing memories are re-embedded
+automatically at startup, keeping old and new vectors comparable — switching
+between with/without an embedding service needs no manual migration.
 
-### 使用方式
+### Usage
 
 ```bash
-# 方式一：零配置 —— 本机跑着 LM Studio / Ollama 等即自动接入，无需任何设置
+# Option 1: zero config — if LM Studio / Ollama etc. is running locally it is picked up automatically
 
-# 方式二：环境变量指定非默认端口/地址
+# Option 2: point at a non-default port/address via env
 EMBEDDING_BASE_URL=http://127.0.0.1:9527 ./agent-memory-server --transport http
 
-# 方式三：配置文件显式指定（跳过探测；配置错误在使用时报错，便于定位）
+# Option 3: explicit config file (skips probing; config errors surface at call time for easy diagnosis)
 ```
 
 ```yaml
 embedding:
-  provider: openai                 # 非空即启用显式模式
-  base_url: http://127.0.0.1:1234  # 缺 /v1 会自动补全
+  provider: openai                 # non-empty enables explicit mode
+  base_url: http://127.0.0.1:1234  # missing /v1 is appended automatically
   model: bge-m3
-  api_key: ""                      # 本地服务可留空
-  dimensions: 1024                 # 必须与模型真实输出维度一致
+  api_key: ""                      # can stay empty for local services
+  dimensions: 1024                 # must match the model's real output
 ```
 
-> 依赖树刻意未引入 TLS：嵌入客户端仅支持 `http://`（本地服务场景）。
-> 接入 https 云端 API（OpenAI / SiliconFlow 等）请起一个本地反代
-> （如 `caddy reverse-proxy --reverse-from 127.0.0.1:1234 to api.siliconflow.cn`），
-> 再按方式三指向反代地址。
+> The dependency tree deliberately excludes TLS: the embedding client only
+> speaks `http://` (local-service scenario). To use an https cloud API
+> (OpenAI / SiliconFlow etc.) run a local reverse proxy (e.g.
+> `caddy reverse-proxy --from 127.0.0.1:1234 to api.siliconflow.cn`) and point
+> option 3 at it.
 
-### 如何增加额外的嵌入语义计算功能（配置文件模式）
+### Adding more embedding backends (config-file mode)
 
-**提供方选择完全由配置文件驱动**，内置两种协议，新增接入点无需改代码：
+**Provider selection is entirely config-file driven**; two protocols are built
+in and new endpoints need no code:
 
-**方式 A：OpenAI 兼容服务（`provider: openai`，默认协议）**——任何提供
-`POST /v1/embeddings` 的服务都能配置接入：云 API 走本地反代、自建推理
-（`infinity`、`text-embeddings-inference`）或 LM Studio / vLLM 等。
-模型挑选规则（自动探测时）见 `pick_model()`：名称含 `embed`/`bge`/`gte`/`e5`/`wemm` 优先。
+**Option A: OpenAI-compatible services (`provider: openai`, default protocol)** —
+anything exposing `POST /v1/embeddings` can be configured in: cloud APIs behind a
+local reverse proxy, self-hosted inference (`infinity`,
+`text-embeddings-inference`), LM Studio / vLLM, etc. For auto-detection the model
+picker (`pick_model()`) prefers names containing `embed`/`bge`/`gte`/`e5`/`wemm`.
 
-**方式 B：Ollama 原生协议（`provider: ollama`）**——走 Ollama 自己的
-`POST /api/embed {"model","input":[..]}` 批量接口（不再经由其 OpenAI 兼容层）：
+**Option B: Ollama native protocol (`provider: ollama`)** — uses Ollama's own
+`POST /api/embed {"model","input":[..]}` batch endpoint (bypassing its OpenAI
+compatibility layer):
 
 ```yaml
 embedding:
-  provider: ollama        # 选择原生协议，跳过自动探测
-  base_url: http://127.0.0.1:11434   # 留空则默认 http://127.0.0.1:11434（不补 /v1）
+  provider: ollama        # select the native protocol, skip auto-detection
+  base_url: http://127.0.0.1:11434   # empty → http://127.0.0.1:11434 (no /v1 appended)
   model: bge-m3
-  dimensions: 1024        # 必须与模型真实输出一致
+  dimensions: 1024        # must match the model's real output
 ```
 
-环境变量等价：`AGENT_MEMORY_EMBEDDING__PROVIDER=ollama`。
+Env equivalent: `AGENT_MEMORY_EMBEDDING__PROVIDER=ollama`.
 
-两种方式共用同一套向量空间机制：空间标识分别为 `openai:<model>@<dim>` /
-`ollama:<model>@<dim>`，在 openai/ollama/伪嵌入之间切换配置并重启，存量记忆自动重嵌。
+Both options share the same vector-space mechanism: space ids are
+`openai:<model>@<dim>` / `ollama:<model>@<dim>`; switching between
+openai/ollama/pseudo and restarting re-embeds existing memories automatically.
 
-**仅当目标服务使用全新协议时才需要改代码**（在 `embedding.rs` 的 `Protocol` 枚举加变体、
-`embed()` 加一个分支、`from_provider()` 加映射，约 30 行），随后同样回到配置文件模式使用。
+**Only a brand-new wire protocol requires code** (add a variant to the
+`Protocol` enum in `embedding.rs`, a branch in `embed()`, and a mapping in
+`from_provider()` — about 30 lines), after which it is again config-file driven.
 
-> 维度一致性是硬约束：`embedding.dimensions` 必须等于模型真实输出，混用维度会导致
-> 余弦相似度失真（向量空间机制会在切换时重嵌兜底，但同空间内维度不一致无法自愈）。
+> Dimension consistency is a hard constraint: `embedding.dimensions` must equal
+> the model's real output; mixing dimensions distorts cosine similarity (the
+> vector-space mechanism re-embeds on switches as a safety net, but inconsistent
+> dimensions inside one space cannot self-heal).
 
-### 实战案例：接入微信 WeMM-Embedding-2B（2026-09-20）
+### Case study: integrating WeChat WeMM-Embedding-2B (2026-09-20)
 
-一次完整的真实嵌入接入记录，可作为同流程的参考模板。
+A complete record of a real-embedding integration; use it as a template for the
+same workflow.
 
-**目标模型**：[WeMM-Embedding-2B](https://github.com/) —— 腾讯微信视觉团队 2026-08 开源的
-多模态嵌入模型（Qwen3.5 底座，文本输入输出 2048 维 L2 归一化向量）。
+**Target model**: [WeMM-Embedding-2B](https://github.com/) — open-sourced in
+Aug 2026 by the WeChat Vision Team at Tencent; a multimodal embedding model
+built on Qwen3.5 (2048-dim L2-normalized vectors for text input).
 
-**步骤（共三步）**：
+**Steps (three total)**:
 
 ```bash
-# 1. 启动 Ollama 服务（brew 安装，launchd 常驻）
+# 1. Start the Ollama service (brew install; launchd-resident)
 brew install ollama && brew services start ollama
 
-# 2. 拉取模型（1.6GB）
+# 2. Pull the model (1.6GB)
 ollama pull milkey/wemm-embedding-2b
 
-# 3. 完成。无需任何配置 —— 重启记忆服务，自动探测命中：
-#    INFO embedding: embedding 服务器自动检测成功
+# 3. Done. No configuration needed — restarting the memory server auto-detects it:
+#    INFO embedding: embedding server auto-detected
 #      base_url=http://127.0.0.1:11434/v1 model=milkey/wemm-embedding-2b:latest dimensions=2048
-#    INFO embedding: 存量重嵌进行中 done=32 → 64 → 75
-#    INFO embedding: 向量空间变化：存量记忆已重嵌 space=openai:milkey/wemm-embedding-2b:latest@2048
+#    INFO embedding: re-embedding existing memories done=32 → 64 → 75
+#    INFO embedding: vector space changed; re-embedded space=openai:milkey/wemm-embedding-2b:latest@2048
 ```
 
-**效果对比**（伪嵌入 → 2048 维真实嵌入）：
+**Before/after** (pseudo embedding → real 2048-dim embeddings):
 
-| 查询 | 命中（similarity） | 说明 |
+| Query | Top hit (similarity) | Notes |
 |---|---|---|
-| 「怎么管控孩子使用平板」 | 平板管控记忆（0.478） | **无任何关键词重叠**，纯语义命中；伪嵌入时代不可能 |
-| 「知识图谱可视化页面」 | 图谱查看器记忆（0.537） | 同上 |
+| "how do I control kids' tablet usage" | tablet-control memory (0.478) | **Zero keyword overlap**, pure semantic hit; impossible with pseudo embeddings |
+| "knowledge graph visualization page" | graph-viewer memory (0.537) | Same |
 
-**过程中发现并修复的三个问题**（均已合入，复现此流程不会再遇到）：
+**Three issues found and fixed along the way** (all merged; you won't hit them
+repeating this flow):
 
-1. **探测冷加载误判**：探测的 embeddings 试算超时原为 600ms，而 2B 模型冷加载首次推理
-   需数秒 → 探测误判"未检测到"回退伪嵌入。修复：`/models` 发现保持 600ms 快失败，
-   命中服务后的试算放宽到 30s（`PROBE_EMBED_TIMEOUT`）。
-2. **重嵌超时导致崩溃循环**：存量重嵌原为 500 条/请求 + 30s 超时，2B 模型扛不住 →
-   setup 失败 → launchd 反复重启。修复：32 条/批 + 600s 超时；失败仅告警不阻断启动，
-   下次重启自动重试（重试到成功才更新空间标记）。
-3. **launchd 拉起卡死在 dyld open()**：从外置盘（/Volumes/...）启动二进制时，launchd
-   拉起进程反复卡死在动态链接阶段（手动终端运行完全正常，采样定格在 `dyld3::open`）。
-   根治：二进制部署到本地盘 `~/.agent-memory/bin/`，plist 指向该路径。
-   **注意：改 plist 后必须 `launchctl unload + load`，仅 `kickstart` 用的还是旧任务定义。**
+1. **Probe cold-load misdetection**: the probe's embeddings test timed out at
+   600ms while a 2B model's first inference takes seconds → misdetection
+   "not found" and fallback to pseudo embeddings. Fix: `/models` discovery keeps
+   600ms fast-fail, but once a service is found the embeddings probe is relaxed
+   to 30s (`PROBE_EMBED_TIMEOUT`).
+2. **Re-embed timeout caused a crash loop**: existing-memory re-embedding used
+   500-per-request + 30s timeout, which a 2B model cannot satisfy → setup failed
+   → launchd restart loop. Fix: batches of 32 + 600s timeout; failures only warn
+   and do not block startup, retried on the next restart (the space marker is
+   only updated after a fully successful re-embed).
+3. **launchd spawn hung in dyld open()**: launching the binary from an external
+   volume (/Volumes/...) repeatedly hung the launchd-spawned process during
+   dynamic linking (terminal runs were completely fine; sampling pinned it at
+   `dyld3::open`). Fix: deploy the binary on a local disk
+   (`~/.agent-memory/bin/`) and point the plist there.
+   **Note: after editing a plist you must `launchctl unload + load`;**
+   **`kickstart` alone keeps using the old job definition.**
 
-**验证清单**（接入后建议逐项确认）：
+**Verification checklist** (run through after any integration):
 
-- [ ] 启动日志出现 `自动检测成功` 与 `存量记忆已重嵌`
-- [ ] `kv_meta` 表 `embedding_space` 已更新为新空间标识
-- [ ] 语义查询（换一种说法的目标内容）similarity ≥ 0.4 且命中预期
-- [ ] 新 `store_memory` 正常（自动使用真实嵌入），无 embedding 报错
+- [ ] Startup log shows `auto-detected` and `re-embedded`
+- [ ] `kv_meta`.`embedding_space` updated to the new space id
+- [ ] A paraphrased semantic query returns similarity ≥ 0.4 with expected hits
+- [ ] New `store_memory` works (automatically using the real embedding), no embedding errors
 
-## 性能基准
+## Performance benchmarks
 
-测试环境：10000 条记忆数据，128 维向量，2000 条带向量。
+Test environment: 10,000 memories, 128-dim vectors, 2,000 with vectors.
 
-| 操作 | Rust (release) | Python (原版) | 提升倍数 |
+| Operation | Rust (release) | Python (original) | Speedup |
 |------|---------------|--------------|---------|
-| 批量插入 | 19,446 条/秒 | 2,372 条/秒 | **8.2x** |
-| 单条查询 | 115,642 查询/秒 (0.009ms) | 7,424 查询/秒 (0.135ms) | **15.6x** |
-| 列表查询 (20条) | 150 查询/秒 (6.66ms) | 57 查询/秒 (17.67ms) | **2.6x** |
-| 统计查询 | 348 查询/秒 (2.87ms) | 206 查询/秒 (4.87ms) | **1.7x** |
-| 向量检索 (top10) | 152 查询/秒 (6.58ms) | 334 查询/秒 (2.99ms) | **0.45x** ⚠️ |
+| Batch insert | 19,446 rec/s | 2,372 rec/s | **8.2x** |
+| Point query | 115,642 q/s (0.009ms) | 7,424 q/s (0.135ms) | **15.6x** |
+| List query (20 rows) | 150 q/s (6.66ms) | 57 q/s (17.67ms) | **2.6x** |
+| Stats query | 348 q/s (2.87ms) | 206 q/s (4.87ms) | **1.7x** |
+| Vector search (top10) | 152 q/s (6.58ms) | 334 q/s (2.99ms) | **0.45x** ⚠️ |
 
-### 关键发现
+### Key findings
 
-1. **写入和点查 Rust 优势巨大**（8-15 倍），无 GIL、零成本抽象、编译期优化的直接体现。
-2. **列表/统计查询 Rust 领先 1.7-2.6 倍**，瓶颈在 SQLite I/O 而非语言层。
-3. **向量检索 Python 反而更快**（2.2 倍）——Python 版用 `sqlite-vec` C 扩展做底层向量计算，Rust 版当前是纯内存余弦相似度。接入 `sqlite-vec` 或 SIMD 优化后可反超。
-4. **内存占用**：Rust 二进制约 5MB，运行时内存 < 20MB；Python 进程基础内存约 30-50MB。
-5. **启动时间**：Rust 冷启动 < 10ms；Python 解释器启动约 100-200ms。
+1. **Rust dominates writes and point queries** (8–15x) — no GIL, zero-cost
+   abstraction, compile-time optimization.
+2. **List/stats queries lead by 1.7–2.6x** — the bottleneck is SQLite I/O, not
+   the language layer.
+3. **Vector search was faster in Python** (2.2x) — the Python version uses the
+   `sqlite-vec` C extension for the heavy lifting while Rust did pure in-memory
+   cosine similarity. With real embedding models and/or SIMD this gap closes.
+4. **Memory footprint**: the Rust binary is ~5MB with < 20MB RSS; the Python
+   process idles at 30–50MB.
+5. **Startup**: Rust cold-start < 10ms; Python interpreter ~100–200ms.
 
-### 复现基准测试
+### Reproducing the benchmarks
 
 ```bash
 # Rust
 cargo run --release --example bench
 
-# Python（在 agent-memory 目录下）
+# Python (in the agent-memory directory)
 python3 ../bench_python.py
 ```
 
-## MCP 工具列表
+## MCP tools
 
-### 记忆工具（9 个）
+### Memory tools (7)
 
-| 工具 | 说明 |
+| Tool | Description |
 |------|------|
-| `add_memory` | 添加记忆 |
-| `get_memory` | 获取单条记忆 |
-| `list_memories` | 列出记忆（分页/过滤） |
-| `search_memories` | 向量语义搜索 |
-| `update_memory` | 更新记忆 |
-| `delete_memory` | 删除记忆 |
-| `get_stats` | 统计信息 |
-| `create_namespace` | 创建命名空间 |
-| `list_namespaces` | 列出命名空间 |
+| `store_memory` | Store a memory (content capped at 10,000 chars, truncated beyond; entities auto-extracted into the graph) |
+| `search_memory` | Semantic vector search (Chinese-friendly, ranked by similarity) |
+| `get_memory` | Fetch one memory |
+| `update_memory` | Update a memory (content changes re-embed automatically) |
+| `delete_memory` | Delete a memory (also cleans the graph MemoryRef) |
+| `list_memories` | List memories (pagination/filtering) |
+| `get_memory_stats` | Statistics |
 
-### 图谱工具（11 个，需 `--features graph`）
+### Graph tools (11; requires `--features graph` and `graph.enabled=true`)
 
-| 工具 | 说明 |
+| Tool | Description |
 |------|------|
-| `graph_create_entity` | 创建实体 |
-| `graph_get_entity` | 获取实体 |
-| `graph_list_entities` | 列出实体 |
-| `graph_delete_entity` | 删除实体 |
-| `graph_create_relation` | 创建关系 |
-| `graph_link_memory` | 关联记忆到实体 |
-| `graph_query` | 多跳图查询 |
-| `graph_aggregate` | 按属性聚合 |
-| `graph_stats` | 图谱统计 |
-| `graph_checkpoint` | 手动 checkpoint |
+| `graph_create_entity` | Create an entity |
+| `graph_get_entity` | Get an entity |
+| `graph_list_entities` | List entities |
+| `graph_delete_entity` | Delete an entity |
+| `graph_create_relation` | Create a relation (idempotent) |
+| `graph_link_memory` | Link a memory to an entity |
+| `graph_get_related_memories` | Reverse-lookup memories linked to an entity |
+| `graph_query` | Read-only Cypher multi-hop queries |
+| `graph_aggregate` | Aggregate by property |
+| `graph_stats` | Graph statistics |
+| `graph_checkpoint` | Manual CHECKPOINT |
 
-## ZCode 配置
+## ZCode configuration
 
-在 `~/.zcode/cli/config.json` 的 `mcp.servers` 中添加。推荐 HTTP 方式（所有会话共用一个常驻进程，避免多个 stdio 进程争抢 `graph.kuzu`）：
+Add to `mcp.servers` in `~/.zcode/cli/config.json`. The HTTP mode is recommended
+(all sessions share one resident process, avoiding multiple stdio processes
+fighting over `graph.kuzu`):
 
 ```json
 {
@@ -297,7 +360,7 @@ python3 ../bench_python.py
 }
 ```
 
-stdio 方式（客户端按需拉起进程）：
+stdio mode (process spawned on demand by the client):
 
 ```json
 {
@@ -312,16 +375,20 @@ stdio 方式（客户端按需拉起进程）：
 }
 ```
 
-> ⚠️ Kùzu 不支持多进程打开同一数据库目录。不要同时运行多个开启图谱的 stdio 会话，
-> 也不要 stdio（开图谱）与 HTTP（开图谱）并存；统一走单进程 HTTP 常驻服务是推荐做法。
+> ⚠️ Kùzu does not allow multiple processes to open the same database directory.
+> Do not run multiple graph-enabled stdio sessions at once, nor mix stdio (graph
+> on) with HTTP (graph on); a single-process resident HTTP service is the
+> recommended setup.
 
-## DSH（DeepSeek Harness）接入
+## DSH (DeepSeek Harness) integration
 
-通过 `@deepseek-ai/dsh-mcp-client` 桥接，工具以 `mcp__agent-memory__<tool>` 命名进入
-DSH 会话（如 `mcp__agent-memory__search_memory`）。**推荐 streamable-http 指向常驻
-8888 服务**：单进程持有 Kùzu 与嵌入热模型，所有 DSH 会话共享同一份记忆。
+Bridge via `@deepseek-ai/dsh-mcp-client`; tools appear in DSH sessions as
+`mcp__agent-memory__<tool>` (e.g. `mcp__agent-memory__search_memory`).
+**streamable-http pointed at the resident 8888 service is recommended**: one
+process owns Kùzu and the warm embedding model, and all DSH sessions share the
+same memory.
 
-在 `cordis.yml` 的 MCP 配置段添加：
+Add to the MCP section of `cordis.yml`:
 
 ```yaml
 - id: mcp-agent-memory
@@ -330,13 +397,14 @@ DSH 会话（如 `mcp__agent-memory__search_memory`）。**推荐 streamable-htt
     serverName: agent-memory
     transport: streamable-http
     url: http://127.0.0.1:8888/mcp
-    # headers:                          # 仅当服务启用 auth_token 时需要
+    # headers:                          # only when auth_token is enabled
     #   Authorization: 'Bearer <token>'
     toolCallTimeoutMs: 60000
 ```
 
-stdio 备选（每个 DSH 会话拉起独立进程；嵌入模型反复冷加载、Kùzu 走 flock 排队，
-仅推荐"不想跑常驻服务"的场景）：
+stdio fallback (each DSH session spawns its own process; the embedding model
+cold-loads per session and Kùzu queues through flock — only recommended if you
+do not want a resident service):
 
 ```yaml
 - id: mcp-agent-memory
@@ -349,49 +417,62 @@ stdio 备选（每个 DSH 会话拉起独立进程；嵌入模型反复冷加载
       AGENT_MEMORY_GRAPH__ENABLED: 'true'
 ```
 
-接入要点：
+Integration notes:
 
-- **协议兼容**：服务端 Streamable HTTP（stateless + JSON 内联）已用官方 TS SDK 验证全链路；
-  `tools/list` 响应含 SEP-2549 必填字段（`ttlMs`/`cacheScope`），Zod 系客户端（DSH/Cursor 等）可正常解析
-- **前置条件**：8888 常驻服务在跑（`launchctl list | grep agent-memory`）；对外暴露需配置
-  `AGENT_MEMORY_SERVER__AUTH_TOKEN` 并在 `headers` 带上 Bearer Token
-- **DSH 侧崩溃隔离**：MCP 插件异常不影响记忆服务；DSH 重连逻辑（默认 10 次退避重试）
-  覆盖服务重启窗口；`resources/list` 等 MCP 资源不被 DSH 桥接（核心能力全在 18 个工具里，无影响）
+- **Protocol compatibility**: the server's Streamable HTTP (stateless + inline
+  JSON) has been verified end-to-end with the official TS SDK; `tools/list`
+  responses include the SEP-2549 required fields (`ttlMs`/`cacheScope`) so
+  Zod-based clients (DSH/Cursor etc.) parse them fine
+- **Prerequisites**: the 8888 resident service is running
+  (`launchctl list | grep agent-memory`); for public exposure set
+  `AGENT_MEMORY_SERVER__AUTH_TOKEN` and send the Bearer token in `headers`
+- **DSH-side crash isolation**: MCP plugin failures do not affect the memory
+  service; DSH's reconnect logic (default 10 backoff attempts) covers service
+  restart windows; MCP `resources` are not bridged by DSH (all core capability
+  lives in the 18 tools, so no impact)
 
-## 配置示例
+## Configuration example
 
 ```yaml
 storage:
   db_path: ./data/memory.db
   embedding_dim: 128
 
+embedding:
+  provider: openai          # empty → auto-detect; openai | ollama
+  base_url: http://127.0.0.1:1234
+  model: bge-m3
+  api_key: null
+  dimensions: 1024
+
 server:
   transport: stdio          # stdio | http
-  http_host: 127.0.0.1      # HTTP 绑定地址（非回环地址必须设 auth_token）
+  http_host: 127.0.0.1      # bind address (non-loopback requires auth_token)
   http_port: 8888
-  auth_token: null          # Bearer Token 鉴权，HTTP 对外暴露时必填
+  auth_token: null          # Bearer token; required when exposing HTTP publicly
 
 graph:
   enabled: false
   db_path: ./data/graph.db
   buffer_pool_size_mb: 256
-  auto_extract: true        # store_memory 自动抽取实体入图谱（默认 true）
-  backfill_on_start: true   # 启动时对存量记忆幂等回填图谱（默认 true）
-  # rules:                  # 可选：追加抽取规则（内置词典之外）
+  auto_extract: true        # store_memory auto-extracts entities into the graph (default true)
+  backfill_on_start: true   # idempotent graph back-fill of existing memories on startup (default true)
+  # rules:                  # optional: extra extraction rules (beyond the built-in dictionary)
   #   - label: System
   #     entity: MyApp
   #     keywords: ["myapp", "my-app"]
 ```
 
-## 依赖
+## Dependencies
 
-- `rusqlite` (bundled) — SQLite 嵌入式数据库
-- `rmcp` 3.2 — MCP 协议实现
-- `serde` / `serde_json` — 序列化
-- `clap` — CLI 参数解析
-- `tokio` — 异步运行时
-- `kuzu` 0.11 (optional) — 嵌入式图数据库
-- `tracing` — 日志
+- `rusqlite` (bundled) — embedded SQLite
+- `rmcp` 3.2 — MCP protocol implementation
+- `serde` / `serde_json` — serialization
+- `clap` — CLI argument parsing
+- `tokio` — async runtime
+- `hyper` / `hyper-util` / `futures` — embedding HTTP client (local, no TLS)
+- `kuzu` 0.11 (optional) — embedded graph database
+- `tracing` — logging
 
 ## License
 
