@@ -155,8 +155,11 @@ PAGE = r"""<!DOCTYPE html>
   #bar b { font-size:14px; }
   #search { background:#0f1420; border:1px solid #2a3550; color:#dde3ee; border-radius:6px;
             padding:4px 10px; width:180px; font-size:12px; }
-  .lg { display:flex; align-items:center; gap:4px; font-size:11px; cursor:pointer; user-select:none; }
-  .lg i { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  #legend { position:fixed; left:12px; bottom:12px; z-index:9; background:#161d2eee;
+            border:1px solid #2a3550; border-radius:10px; padding:8px 12px;
+            display:grid; grid-template-columns:repeat(2, auto); gap:5px 16px; }
+  .lg { display:flex; align-items:center; gap:5px; font-size:11px; cursor:pointer; user-select:none; color:#aab4c8; }
+  .lg i { width:9px; height:9px; border-radius:50%; display:inline-block; }
   .lg.off { opacity:.25; }
   #meta { margin-left:auto; font-size:11px; color:#8b96ab; }
   #refresh { background:#2a3550; color:#dde3ee; border:0; border-radius:6px; padding:5px 12px; cursor:pointer; }
@@ -185,11 +188,11 @@ PAGE = r"""<!DOCTYPE html>
 <div id="bar">
   <b>记忆体知识图谱</b>
   <input id="search" placeholder="搜索节点…">
-  <span id="legend"></span>
   <span id="meta"></span>
   <button id="refresh">刷新数据</button>
 </div>
 <svg id="stage"></svg>
+<div id="legend"></div>
 <div id="panel">
   <div id="p-head">记忆树</div>
   <div id="p-sub">点击图谱中的实体节点，查看其关联的全部记忆</div>
