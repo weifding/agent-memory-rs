@@ -95,6 +95,96 @@ tail -f ~/.agent-memory/server.log                                    # 查看�
 plist 关键配置：`RunAtLoad` + `KeepAlive=true`，环境变量 `AGENT_MEMORY_GRAPH__ENABLED=true`，
 标准错误写入 `~/.agent-memory/server.log`。
 
+## 嵌入语义计算（Embedding）
+
+### 工作原理
+
+`store_memory` / `search_memory` 写入与检索都依赖文本向量。服务按以下优先级选择嵌入来源
+（实现见 `src/embedding.rs`）：
+
+1. **显式配置**：配置文件或环境变量设置了 `embedding.provider` → 直接采用，不做探测
+2. **自动探测**：启动时并发探测本机常见推理服务的 OpenAI 兼容端点
+   （LM Studio:1234 / Ollama:11434 / vLLM:8000 / Xinference:9997 / llama.cpp:8080，
+   或 `EMBEDDING_BASE_URL` 指定的地址），`GET /v1/models` 选模型 → `POST /v1/embeddings`
+   试算维度，命中即自动回填 provider/model/维度
+3. **伪嵌入回退**：都未命中时用内置字符 bigram 哈希嵌入（零外部依赖，字面相似度可用，
+   语义泛化弱）
+
+**向量空间一致性**：当前空间以 `kv_meta.embedding_space` 记录
+（如 `openai:bge-m3@1024` 或 `pseudo-bigram@1536`）。提供方或维度变化时，启动阶段自动
+**重嵌全部存量记忆**，保证新旧向量可比；因此在有/无 embedding 服务之间切换无需手工迁移。
+
+### 使用方式
+
+```bash
+# 方式一：零配置 —— 本机跑着 LM Studio / Ollama 等即自动接入，无需任何设置
+
+# 方式二：环境变量指定非默认端口/地址
+EMBEDDING_BASE_URL=http://127.0.0.1:9527 ./agent-memory-server --transport http
+
+# 方式三：配置文件显式指定（跳过探测；配置错误在使用时报错，便于定位）
+```
+
+```yaml
+embedding:
+  provider: openai                 # 非空即启用显式模式
+  base_url: http://127.0.0.1:1234  # 缺 /v1 会自动补全
+  model: bge-m3
+  api_key: ""                      # 本地服务可留空
+  dimensions: 1024                 # 必须与模型真实输出维度一致
+```
+
+> 依赖树刻意未引入 TLS：嵌入客户端仅支持 `http://`（本地服务场景）。
+> 接入 https 云端 API（OpenAI / SiliconFlow 等）请起一个本地反代
+> （如 `caddy reverse-proxy --reverse-from 127.0.0.1:1234 to api.siliconflow.cn`），
+> 再按方式三指向反代地址。
+
+### 如何增加额外的嵌入语义计算功能（扩展指南）
+
+**方式 A：零代码接入（推荐先试）**——任何提供 OpenAI 兼容 `POST /v1/embeddings`
+接口的服务都能直接插：云 API 走反代、自建推理（`infinity`、`text-embeddings-inference`）
+起在本地端口即可被探测或显式配置命中，模型挑选规则见 `pick_model()`
+（名称含 `embed`/`bge`/`gte`/`e5`/`wemm` 优先）。
+
+**方式 B：新增一种协议/提供方（改代码）**——例如 Ollama 原生 `/api/embeddings`、
+某云 SDK、或内嵌本地模型（fastembed/candle）：
+
+1. **抽象提供方接口**（当前 `EmbeddingClient` 为具体类型，建议先抽出 trait）：
+
+   ```rust
+   // src/embedding.rs
+   #[async_trait::async_trait]
+   pub trait EmbeddingProvider: Send + Sync {
+       async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+       fn dimensions(&self) -> usize;
+       /// 向量空间标识，格式 "<provider>:<model>@<dim>"，变化即触发全量重嵌
+       fn space_id(&self) -> String;
+   }
+   ```
+
+   让现有 `EmbeddingClient` 实现该 trait（`space_id` 即现在的
+   `openai:{model}@{dim}`），`MemoryHandler.embedding` 字段类型改为
+   `Option<Arc<dyn EmbeddingProvider>>`——`embed_text()` 调用点无需改动。
+
+2. **实现新提供方**：新建结构体实现 `embed()`，例如 Ollama 原生协议
+   `POST /api/embeddings {"model":..., "prompt":...}` → 解析 `embedding` 字段；
+   批量接口则一次传多文本并按 `index` 还原顺序（参照 `EmbeddingClient::embed`）。
+   关键约定：**真实提供方请求失败必须返回 Err**——上层会报错而不是静默落伪嵌入向量，
+   防止污染向量空间。
+
+3. **接入装配**：`embedding::setup()` 里按 `config.embedding.provider` 分支构造
+   （如 `provider = "ollama"` 时构造 `OllamaProvider`，并跳过 OpenAI 探测）；
+   `space_id` 用新前缀（如 `ollama:{model}@{dim}`），首次启用即自动重嵌存量。
+
+4. **配置与文档**：`config.rs` 的 `EmbeddingConfig` 如需新字段（如专属端口）在此加；
+   同时更新本节和 `AGENTS.md`（双实现同步约束）。
+
+5. **验证**：启动后看日志 `embedding provider: 使用显式配置` / `向量空间变化：存量记忆已重嵌`；
+   存一条 → `search_memory` 语义查询应命中；换回原提供方确认重嵌链路无报错。
+
+> 维度一致性是硬约束：`embedding.dimensions` 必须等于模型真实输出，混用维度会导致
+> 余弦相似度失真（向量空间机制会在切换时重嵌兜底，但同空间内维度不一致无法自愈）。
+
 ## 性能基准
 
 测试环境：10000 条记忆数据，128 维向量，2000 条带向量。
