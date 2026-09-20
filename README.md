@@ -315,6 +315,49 @@ stdio 方式（客户端按需拉起进程）：
 > ⚠️ Kùzu 不支持多进程打开同一数据库目录。不要同时运行多个开启图谱的 stdio 会话，
 > 也不要 stdio（开图谱）与 HTTP（开图谱）并存；统一走单进程 HTTP 常驻服务是推荐做法。
 
+## DSH（DeepSeek Harness）接入
+
+通过 `@deepseek-ai/dsh-mcp-client` 桥接，工具以 `mcp__agent-memory__<tool>` 命名进入
+DSH 会话（如 `mcp__agent-memory__search_memory`）。**推荐 streamable-http 指向常驻
+8888 服务**：单进程持有 Kùzu 与嵌入热模型，所有 DSH 会话共享同一份记忆。
+
+在 `cordis.yml` 的 MCP 配置段添加：
+
+```yaml
+- id: mcp-agent-memory
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: agent-memory
+    transport: streamable-http
+    url: http://127.0.0.1:8888/mcp
+    # headers:                          # 仅当服务启用 auth_token 时需要
+    #   Authorization: 'Bearer <token>'
+    toolCallTimeoutMs: 60000
+```
+
+stdio 备选（每个 DSH 会话拉起独立进程；嵌入模型反复冷加载、Kùzu 走 flock 排队，
+仅推荐"不想跑常驻服务"的场景）：
+
+```yaml
+- id: mcp-agent-memory
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: agent-memory
+    transport: stdio
+    command: /Users/dingweifeng/.agent-memory/bin/agent-memory-server
+    env:
+      AGENT_MEMORY_GRAPH__ENABLED: 'true'
+```
+
+接入要点：
+
+- **协议兼容**：服务端 Streamable HTTP（stateless + JSON 内联）已用官方 TS SDK 验证全链路；
+  `tools/list` 响应含 SEP-2549 必填字段（`ttlMs`/`cacheScope`），Zod 系客户端（DSH/Cursor 等）可正常解析
+- **前置条件**：8888 常驻服务在跑（`launchctl list | grep agent-memory`）；对外暴露需配置
+  `AGENT_MEMORY_SERVER__AUTH_TOKEN` 并在 `headers` 带上 Bearer Token
+- **DSH 侧崩溃隔离**：MCP 插件异常不影响记忆服务；DSH 重连逻辑（默认 10 次退避重试）
+  覆盖服务重启窗口；`resources/list` 等 MCP 资源不被 DSH 桥接（核心能力全在 18 个工具里，无影响）
+
 ## 配置示例
 
 ```yaml
