@@ -172,7 +172,7 @@ impl ServerHandler for MemoryHandler {
         #[cfg(feature = "graph")]
         if self.graph.is_some() {
             tools.extend([
-                Tool::new("graph_create_entity", "Create a knowledge graph entity", schema(json!({"type":"object","properties":{"label":{"type":"string"},"name":{"type":"string"},"properties":{"type":"object"}},"required":["label","name"]}))),
+                Tool::new("graph_create_entity", "Create a knowledge graph entity (label 可任意扩展：预设外 label 首次写入自动建表，属性键自动加列，值统一按字符串存储；label 须为 [A-Za-z_][A-Za-z0-9_]* 标识符)", schema(json!({"type":"object","properties":{"label":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]*$"},"name":{"type":"string"},"properties":{"type":"object","description":"任意键值对，值按字符串存储","additionalProperties":true}},"required":["label","name"]}))),
                 Tool::new("graph_get_entity", "Get a graph entity", schema(json!({"type":"object","properties":{"label":{"type":"string"},"name":{"type":"string"}},"required":["label","name"]}))),
                 Tool::new("graph_list_entities", "List entities", schema(json!({"type":"object","properties":{"label":{"type":"string"},"limit":{"type":"integer"}},"required":["label"]}))),
                 Tool::new("graph_delete_entity", "Delete a graph entity", schema(json!({"type":"object","properties":{"label":{"type":"string"},"name":{"type":"string"}},"required":["label","name"]}))),
@@ -334,13 +334,11 @@ impl MemoryHandler {
         );
         #[cfg(feature = "graph")]
         {
-            // 自动入图：为每个命中实体建节点（幂等）并 link 到 MemoryRef；失败仅告警不影响记忆落库
+            // 自动入图：为每个命中实体建节点（幂等，label 表按需自动供给）并 link 到
+            // MemoryRef；失败仅告警不影响记忆落库
             let mut graph_linked = 0usize;
             if let (Some(gdb), true) = (&self.graph, self.config.graph.auto_extract) {
                 for hit in &hits {
-                    if !graph::NODE_LABELS.contains(&hit.label.as_str()) {
-                        continue;
-                    }
                     let preview = memory.content.chars().take(200).collect::<String>();
                     if let Err(e) = graph::create_entity(
                         gdb,
@@ -580,8 +578,20 @@ impl MemoryHandler {
     async fn handle_graph_create_entity(&self, args: &Value) -> Result<String> {
         let label = args["label"].as_str().unwrap_or("");
         let name = args["name"].as_str().unwrap_or("");
+        // 属性值统一按字符串存储：数字/布尔转文本，null 丢弃，数组/对象序列化为 JSON
         let props: std::collections::HashMap<String, String> = args["properties"]
-            .as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+            .as_object().map(|o| {
+                o.iter().filter_map(|(k, v)| {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        Value::Null => return None,
+                        other => other.to_string(),
+                    };
+                    Some((k.clone(), s))
+                }).collect()
+            })
             .unwrap_or_default();
         let status = graph::create_entity(self.graph()?, label, name, &props)?;
         tracing::info!(target: "graph::create_entity", label = %label, name = %name, status = %status, "graph entity created");

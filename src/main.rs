@@ -89,9 +89,6 @@ async fn main() -> Result<()> {
             let hits = extract::extract(&mem.content, &mem.namespace, &mem.topics, &config.graph.rules);
             let mut linked = 0usize;
             for hit in &hits {
-                if !graph_api::NODE_LABELS.contains(&hit.label.as_str()) {
-                    continue;
-                }
                 let preview = mem.content.chars().take(200).collect::<String>();
                 let _ = graph_api::create_entity(
                     gdb,

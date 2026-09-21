@@ -4,8 +4,8 @@
 //! 1. 词典层：内置 + 配置追加的关键词规则，命中 content / topics 即产出 (label, entity)；
 //! 2. 骨架层：非 default 命名空间自动视为一个 Project 实体，作为聚合骨架。
 //!
-//! 抽取结果只做确定性去重；label 合法性由调用侧（server.rs / main.rs，
-//! graph feature 开启时）对照 `graph::NODE_LABELS` 再校验。
+//! 抽取结果只做确定性去重；label 由调用侧（server.rs / main.rs，graph feature
+//! 开启时）做标识符合法性校验，预设外 label 的节点表按需自动供给（graph.rs）。
 
 use serde::{Deserialize, Serialize};
 

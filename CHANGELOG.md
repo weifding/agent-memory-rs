@@ -1,5 +1,51 @@
 # 修改记录（agent-memory-rs）
 
+## 2026-09-21 — 图谱 label 自由扩展 + graph_create_entity 写入故障修复
+
+### 故障一：graph_create_entity 带"最简属性"报 Cypher write failed
+
+根因：节点表列结构在 `init_schema` 写死，`CREATE (n:Label {...})` 带任何
+未预定义的属性键即被 Kùzu 拒绝（如 System 传 `{foo:'bar'}`）。
+
+### 故障二（连带发现，更严重）：主键列等值匹配静默失配
+
+实测（kuzu 0.11.3 MSVC 构建）：`MATCH (n:Label {name:'x'})` 与
+`WHERE n.name='x'` 走哈希索引路径，**查不到已存在的节点**（全表扫描正常、
+非主键列等值正常）。后果：get_entity 永远 not_found、create_entity 幂等
+检查失效（重复创建报错）、create_relation/link_memory 幂等检查失效
+（静默重复建边）、get_related_memories 恒空。`MemoryRef.memory_id`
+恰好能命中属例外表现，掩盖了问题。
+
+### 修复
+
+1. **label 白名单 → 标识符校验**：`validate_label` 改为 `[A-Za-z_][A-Za-z0-9_]*`
+   检查（保留 Cypher 注入防线），任意新 label 可扩展。`NODE_LABELS` 降级为
+   "预设清单"（仅 init_schema 建表 + SHOW_TABLES 失败时兜底）。
+2. **表结构按需供给**：`ensure_node_table`——预设外 label 首次写入自动
+   `CREATE NODE TABLE (name STRING, created_at STRING, PK name)`；已有表
+   缺属性键时 `ALTER TABLE ADD <key> STRING`（属性值统一按字符串存）。
+   新增内部专用 `raw_query`（CALL 系统表函数不走 MATCH 门禁）。
+3. **主键等值统一走 `(col + '') = 'value'`**（`pk_eq` 辅助函数）：强制表达式
+   求值绕开失配的索引路径。get/create/delete/relation/link/related 全部
+   8 处等值查询改写。升级 kuzu 修复后可整体还原。
+4. **关系按需供给**：`create_relation` 预设三元组外自动
+   `CREATE REL TABLE IF NOT EXISTS <REL> (FROM s TO t)`（预设关系名端点
+   固定不可重定义）；`link_memory`/`get_related_memories` 对预设外 label
+   自动用 `{LABEL}_MEMORY` 关系。
+5. **杂项**：`graph_stats` 动态枚举全部节点表（`CALL SHOW_TABLES() RETURN *`，
+   注意必须带括号）；`execute` 错误带上 Kùzu 底层原因；工具 handler 属性值
+   支持数字/布尔（转字符串），null 丢弃；`MemoryRef` 对工具保留。
+   历史遗留影响说明：修复前的 graph_linked 计数与重复建边防重不可靠，
+   升级后同 (源,关系,目标) 重复边不再增长（存量重复边如需清理可
+   `graph_query` 排查后手工处理）。
+
+### 验证（19/19 全通过）
+
+新 label 创建/幂等、预设 label 新属性键（原故障场景）、CJK/ASCII 实体
+get、MemoryRef 保留、注入 label 与非法标识符拒绝、store 自动入图、
+动态 label link/关联查询、全新动态关系 + 幂等、端点冲突报错、stats 含
+动态 label、delete、search 回归。
+
 ## 2026-09-19 — 修复 discover 生命周期 tools/list 被 Zod 拒收（ttlMs/cacheScope 缺失）
 
 ### 现象
