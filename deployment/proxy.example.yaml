@@ -18,5 +18,8 @@ access_key: "change-me"
 # 代理→远端服务器鉴权 token（代理自动注入 Authorization 头）
 server_auth_token: "change-me-too"
 
+# 写缓冲队列容量（写操作立即返回成功，后台依次转发到后端）
+write_queue_size: 1000
+
 # 日志级别
 log_level: "INFO"

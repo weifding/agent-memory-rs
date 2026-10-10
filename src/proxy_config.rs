@@ -30,6 +30,10 @@ pub struct ProxyConfig {
     /// 日志级别
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// 写缓冲队列容量（默认 1000）
+    #[serde(default = "default_write_queue_size")]
+    pub write_queue_size: usize,
 }
 
 fn default_listen_host() -> String {
@@ -44,6 +48,9 @@ fn default_target() -> String {
 fn default_log_level() -> String {
     "INFO".to_string()
 }
+fn default_write_queue_size() -> usize {
+    1000
+}
 
 impl Default for ProxyConfig {
     fn default() -> Self {
@@ -54,6 +61,7 @@ impl Default for ProxyConfig {
             access_key: None,
             server_auth_token: None,
             log_level: default_log_level(),
+            write_queue_size: default_write_queue_size(),
         }
     }
 }
@@ -96,6 +104,11 @@ fn apply_env_override(config: &mut ProxyConfig, key: &str, value: &str) {
         "ACCESS_KEY" => config.access_key = Some(value.to_string()),
         "SERVER_AUTH_TOKEN" => config.server_auth_token = Some(value.to_string()),
         "LOG_LEVEL" => config.log_level = value.to_string(),
+        "WRITE_QUEUE_SIZE" => {
+            if let Ok(v) = value.parse() {
+                config.write_queue_size = v;
+            }
+        }
         _ => {}
     }
 }
