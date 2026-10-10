@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "Framework-agnostic memory system for AI agents, exposed as an MCP server (Rust implementation)"
 
+[[bin]]
+name = "agent-memory-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent-memory-proxy"
+path = "src/bin/proxy.rs"
+
 [features]
 default = []
 graph = ["kuzu"]
@@ -30,6 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
+http-body = "1"
 futures = "0.3"
 
 [profile.release]

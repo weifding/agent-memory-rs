@@ -1,0 +1,9 @@
+target/
+scripts/
+examples/
+.git/
+.github/
+*.md
+CHANGELOG.md
+Dockerfile
+.dockerignore

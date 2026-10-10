@@ -4,5 +4,6 @@ pub mod extract;
 #[cfg(feature = "graph")]
 pub mod graph;
 pub mod models;
+pub mod proxy_config;
 pub mod server;
 pub mod storage;

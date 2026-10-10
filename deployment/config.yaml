@@ -1,0 +1,25 @@
+# agent-memory-server Docker 容器配置
+# 容器内存储路径固定为 /data，由 volume 持久化
+storage:
+  db_path: "/data/memory.db"
+
+# embedding 可选：配置后使用外部 embedding 服务，否则用内置 pseudo embedding
+# embedding:
+#   provider: "openai"
+#   base_url: "http://your-embedding-service:8080/v1"
+#   api_key: "sk-..."
+#   model: "text-embedding-3-small"
+#   dimensions: 1536
+
+server:
+  transport: "http"
+  http_host: "0.0.0.0"
+  http_port: 8888
+  # 鉴权 token：由 AGENT_MEMORY_SERVER__AUTH_TOKEN 环境变量覆盖
+  # 非 0.0.0.0 以外地址必须设置（容器内绑定 0.0.0.0 需要）
+  auth_token: ""
+
+graph:
+  enabled: false
+
+log_level: "INFO"
