@@ -135,11 +135,13 @@ async fn main() -> Result<()> {
     // 启动写队列后台 worker
     let worker_target = config.target.clone();
     let worker_auth_token = config.server_auth_token.clone();
+    let worker_journal_dir = config.journal_dir.clone();
     tokio::spawn(write_worker(
         write_rx,
         worker_target,
         worker_auth_token,
         http_client.clone(),
+        worker_journal_dir,
     ));
 
     let state = ProxyState {
@@ -446,25 +448,31 @@ async fn forward_request_once(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// 写队列后台 worker：单线程依次转发写请求到后端（共享连接池；瞬时错误重试一次）
+/// 写队列后台 worker：单线程依次转发写请求到后端。
+/// 客户端已收到 ACK，转发失败绝不能丢——重试后仍失败的一律落盘 journal，
+/// worker 启动时（含代理重启后）重放 journal，成功一条删一条。
 async fn write_worker(
     mut rx: tokio::sync::mpsc::Receiver<WriteTask>,
     target: String,
     server_auth_token: Option<String>,
     client: SharedClient,
+    journal_dir: String,
 ) {
     tracing::info!(target: "write_queue", "写队列 worker 已启动");
+
+    // 启动先重放上次遗留的失败 journal（代理重启丢的是内存队列，落盘的不丢）
+    journal_replay_all(&client, &target, &server_auth_token, std::path::Path::new(&journal_dir)).await;
 
     while let Some(task) = rx.recv().await {
         let started = Instant::now();
         let method = task.method.clone();
 
-        // 写转发失败即丢数据（客户端已收到 ACK），瞬时连接错误重试一次兜底；
         // store_memory 注入了固定 memory_id 且后端 INSERT OR REPLACE，重试幂等安全
         let mut attempt = 0;
         loop {
             match forward_write_task(&client, &task, &target, &server_auth_token).await {
-                Ok(status) => {
+                // 非 2xx 同样是失败（此前 415 曾被当成功记 INFO，后端拒收但客户端已 ACK）
+                Ok(status) if (200..300).contains(&status) => {
                     tracing::info!(
                         target: "write_queue",
                         method = %method,
@@ -473,6 +481,22 @@ async fn write_worker(
                         elapsed_ms = started.elapsed().as_millis(),
                         "写操作已转发到后端"
                     );
+                    break;
+                }
+                Ok(status) if attempt == 0 && (500..600).contains(&status) => {
+                    attempt += 1;
+                    tracing::warn!(target: "write_queue", method = %method, status = status, "后端 5xx，重试");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Ok(status) => {
+                    tracing::error!(
+                        target: "write_queue",
+                        method = %method,
+                        status = status,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "写操作被后端拒绝，已落盘 journal"
+                    );
+                    journal_persist(std::path::Path::new(&journal_dir), &task);
                     break;
                 }
                 Err(e) if attempt == 0 && is_transient_legacy_error(&e) => {
@@ -491,8 +515,9 @@ async fn write_worker(
                         method = %method,
                         error = %e,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "写操作转发失败（已丢弃）"
+                        "写操作转发失败，已落盘 journal"
                     );
+                    journal_persist(std::path::Path::new(&journal_dir), &task);
                     break;
                 }
             }
@@ -500,6 +525,78 @@ async fn write_worker(
     }
 
     tracing::warn!(target: "write_queue", "写队列 worker 退出（channel 已关闭）");
+}
+
+/// 失败写请求落盘：JSON 文件 {method, body}，文件名带时间戳+uuid 防碰撞。
+/// 落盘本身失败只告警（磁盘满等），不阻塞队列。
+fn journal_persist(dir: &std::path::Path, task: &WriteTask) {
+    let entry = serde_json::json!({
+        "method": task.method,
+        "body": String::from_utf8_lossy(&task.body),
+    });
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::error!(target: "write_queue", error = %e, "创建 journal 目录失败");
+        return;
+    }
+    let file = dir.join(format!(
+        "{}-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        uuid::Uuid::new_v4()
+    ));
+    match std::fs::write(&file, entry.to_string()) {
+        Ok(()) => tracing::warn!(target: "write_queue", file = %file.display(), "写请求已落盘待重放"),
+        Err(e) => tracing::error!(target: "write_queue", file = %file.display(), error = %e, "journal 落盘失败，该写请求丢失"),
+    }
+}
+
+/// 重放 journal 目录中的全部遗留写请求：成功一条删一条，失败的保留等下次
+async fn journal_replay_all(
+    client: &SharedClient,
+    target: &str,
+    server_auth_token: &Option<String>,
+    dir: &std::path::Path,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return, // 目录不存在 = 无遗留
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return;
+    }
+    tracing::warn!(target: "write_queue", count = files.len(), "发现遗留 journal，开始重放");
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&content) else {
+            tracing::error!(target: "write_queue", file = %file.display(), "journal 条目损坏，跳过");
+            continue;
+        };
+        let task = WriteTask {
+            method: entry["method"].as_str().unwrap_or("POST").to_string(),
+            uri: String::new(),
+            headers: axum::http::HeaderMap::new(),
+            body: bytes::Bytes::from(entry["body"].as_str().unwrap_or("").to_string().into_bytes()),
+        };
+        match forward_write_task(client, &task, target, server_auth_token).await {
+            Ok(status) if (200..300).contains(&status) => {
+                let _ = std::fs::remove_file(&file);
+                tracing::info!(target: "write_queue", file = %file.display(), status = status, "journal 重放成功");
+            }
+            Ok(status) => {
+                tracing::error!(target: "write_queue", file = %file.display(), status = status, "journal 重放被拒，保留文件");
+            }
+            Err(e) => {
+                tracing::error!(target: "write_queue", file = %file.display(), error = %e, "journal 重放失败，保留文件");
+            }
+        }
+    }
 }
 
 /// 判断 legacy client 错误是否为瞬时连接错误
@@ -537,6 +634,17 @@ async fn forward_write_task(
         forward_req.headers_mut().insert(
             axum::http::header::ACCEPT,
             axum::http::HeaderValue::from_static("application/json, text/event-stream"),
+        );
+    }
+
+    // 确保 Content-Type（journal 重放的 task headers 为空，缺它后端 415）
+    if !task
+        .headers
+        .contains_key(axum::http::header::CONTENT_TYPE)
+    {
+        forward_req.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
         );
     }
 

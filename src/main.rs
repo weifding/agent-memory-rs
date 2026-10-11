@@ -78,6 +78,46 @@ async fn main() -> Result<()> {
 
     let handler = MemoryHandler::new(storage.clone(), graph.clone(), embedding.clone(), config.clone());
 
+    // 周期性 WAL checkpoint：WAL 模式下数据先写 WAL 文件，checkpoint 才合并进主库。
+    // 容器环境若从不主动 checkpoint，最新数据长期只存在于 WAL——卷意外即全灭。
+    // 每 30s 一次 TRUNCATE checkpoint 把 WAL 压回主库；遇并发读写 busy 则等下一轮。
+    {
+        let ckpt_storage = storage.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(e) = ckpt_storage.checkpoint() {
+                    tracing::warn!(target: "storage", error = %e, "periodic wal_checkpoint failed");
+                }
+            }
+        });
+    }
+
+    // 优雅关闭：SIGTERM（docker stop）/ SIGINT 触发后等待在途请求完成，
+    // 进程退出前显式 checkpoint，把 WAL 尾部数据压回主库（信号默认处理不执行 Drop，必须显式做）
+    async fn shutdown_signal() {
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut s) => { s.recv().await; }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+        tracing::info!("shutdown signal received, draining...");
+    }
+
     // 启动回填：把存量记忆按同一套抽取规则补建图谱（create_entity / link_memory 均幂等，可安全重复）
     #[cfg(feature = "graph")]
     if let (Some(gdb), true) = (&graph, config.graph.enabled && config.graph.backfill_on_start) {
@@ -144,6 +184,8 @@ async fn main() -> Result<()> {
                 .serve((tokio::io::stdin(), tokio::io::stdout()))
                 .await?;
             running.waiting().await?;
+            // stdin 关闭（客户端退出）后把 WAL 尾部压回主库
+            storage.checkpoint()?;
         }
         "http" | "streamable-http" => {
             use rmcp::transport::streamable_http_server::{
@@ -182,7 +224,12 @@ async fn main() -> Result<()> {
                     // 与 ZCode 等客户端兼容：走 stateless + JSON 内联响应，
                     // 规避该 fork 在 SSE GET 流上的响应分发缺陷（响应丢失导致工具列表超时）
                     .with_legacy_session_mode(false)
-                    .with_json_response(true),
+                    .with_json_response(true)
+                    // 禁用 rmcp 默认 Host 校验（仅放行 localhost）——0.0.0.0 部署时
+                    // 合法客户端的 Host 是任意本机 IP/代理地址，默认白名单会把它们
+                    // 全部 403（DNS rebinding 防护由强制 Bearer 鉴权覆盖：非回环绑定
+                    // 未配置 auth_token 直接拒绝启动）
+                    .disable_allowed_hosts(),
             );
 
             let router = axum::Router::new().nest_service("/mcp", service);
@@ -289,7 +336,13 @@ async fn main() -> Result<()> {
             let addr = format!("{}:{}", config.server.http_host, config.server.http_port);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             tracing::info!("HTTP MCP server listening on http://{}/mcp", addr);
-            axum::serve(listener, router).await?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+            // 优雅关闭完成后显式 checkpoint：SIGTERM 默认处理不执行 Drop，
+            // 不显式 close 的话 WAL 尾部数据（最多 30s）只在 WAL 文件里
+            storage.checkpoint()?;
+            tracing::info!("final wal_checkpoint done, exiting");
         }
         other => {
             anyhow::bail!(

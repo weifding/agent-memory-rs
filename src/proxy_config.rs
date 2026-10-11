@@ -34,6 +34,10 @@ pub struct ProxyConfig {
     /// 写缓冲队列容量（默认 1000）
     #[serde(default = "default_write_queue_size")]
     pub write_queue_size: usize,
+
+    /// 写失败 journal 目录（转发失败的写请求落盘待重放，默认 ./write-journal）
+    #[serde(default = "default_journal_dir")]
+    pub journal_dir: String,
 }
 
 fn default_listen_host() -> String {
@@ -51,6 +55,9 @@ fn default_log_level() -> String {
 fn default_write_queue_size() -> usize {
     1000
 }
+fn default_journal_dir() -> String {
+    "write-journal".to_string()
+}
 
 impl Default for ProxyConfig {
     fn default() -> Self {
@@ -62,6 +69,7 @@ impl Default for ProxyConfig {
             server_auth_token: None,
             log_level: default_log_level(),
             write_queue_size: default_write_queue_size(),
+            journal_dir: default_journal_dir(),
         }
     }
 }
@@ -109,6 +117,7 @@ fn apply_env_override(config: &mut ProxyConfig, key: &str, value: &str) {
                 config.write_queue_size = v;
             }
         }
+        "JOURNAL_DIR" => config.journal_dir = value.to_string(),
         _ => {}
     }
 }
