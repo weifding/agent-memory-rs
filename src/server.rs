@@ -150,8 +150,8 @@ impl ServerHandler for MemoryHandler {
         let mut tools = vec![
             Tool::new(
                 "store_memory",
-                "Store a new memory. 单条记忆 content 上限 10000 字符，超长自动截断",
-                schema(json!({"type":"object","properties":{"content":{"type":"string","maxLength":10000,"description":"记忆正文，单条上限 10000 字符，超长截断"},"namespace":{"type":"string"},"category":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"importance":{"type":"number"}},"required":["content"]})),
+                "Store a new memory. 单条记忆 content 上限 10000 字符，超长自动截断。memory_id 仅供代理写缓冲层注入（客户端无需传）",
+                schema(json!({"type":"object","properties":{"content":{"type":"string","maxLength":10000,"description":"记忆正文，单条上限 10000 字符，超长截断"},"namespace":{"type":"string"},"category":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"importance":{"type":"number"},"memory_id":{"type":"string","description":"可选，代理写缓冲层注入的预生成 UUID；直连客户端无需传"}},"required":["content"]})),
             ),
             Tool::new(
                 "search_memory",
@@ -309,6 +309,14 @@ impl MemoryHandler {
         let mut memory = Memory::new(content, namespace.clone(), category.clone());
         memory.importance = importance;
         memory.topics = tags;
+        // 可选 memory_id：代理写缓冲队列本地预生成 ID 后注入，保证代理即时 ACK
+        // 返回的 ID 与后端落库 ID 一致（否则客户端拿到的 ID 无法 update/delete）。
+        // 仅接受合法 UUID v4 格式，非法值静默忽略走服务端生成。
+        if let Some(provided) = args["memory_id"].as_str() {
+            if uuid::Uuid::parse_str(provided).is_ok() {
+                memory.id = provided.to_string();
+            }
+        }
 
         // 规则抽取实体（词典 + 命名空间骨架），结果随记忆落 SQLite entities 列
         let hits = crate::extract::extract(

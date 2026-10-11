@@ -64,6 +64,12 @@ struct WriteTask {
     body: bytes::Bytes,
 }
 
+/// 共享 HTTP 客户端类型别名
+type SharedClient = hyper_util::client::legacy::Client<
+    hyper_util::client::legacy::connect::HttpConnector,
+    axum::body::Body,
+>;
+
 /// 代理共享状态
 #[derive(Clone)]
 struct ProxyState {
@@ -71,6 +77,10 @@ struct ProxyState {
     access_key: Option<String>,
     server_auth_token: Option<String>,
     write_tx: tokio::sync::mpsc::Sender<WriteTask>,
+    /// 全进程共享的 HTTP 客户端：连接池跨请求复用。
+    /// 此前读路径每请求新建 client，连接无法复用且后端重启/网络抖动时
+    /// 易出现 hyper SendRequest 瞬时错误（「转发失败」）
+    http_client: SharedClient,
 }
 
 #[tokio::main]
@@ -119,16 +129,25 @@ async fn main() -> Result<()> {
     // 创建写缓冲队列
     let (write_tx, write_rx) = tokio::sync::mpsc::channel::<WriteTask>(config.write_queue_size);
 
+    // 全进程共享一个 HTTP 客户端（读路径 + 写 worker 共用连接池）
+    let http_client = build_http_client();
+
     // 启动写队列后台 worker
     let worker_target = config.target.clone();
     let worker_auth_token = config.server_auth_token.clone();
-    tokio::spawn(write_worker(write_rx, worker_target, worker_auth_token));
+    tokio::spawn(write_worker(
+        write_rx,
+        worker_target,
+        worker_auth_token,
+        http_client.clone(),
+    ));
 
     let state = ProxyState {
         target: config.target.clone(),
         access_key: config.access_key.clone(),
         server_auth_token: config.server_auth_token.clone(),
         write_tx,
+        http_client: http_client.clone(),
     };
 
     // 所有请求走 proxy_handler（内部处理 health check、鉴权、转发/入队）
@@ -222,7 +241,7 @@ fn handle_write(
     started: Instant,
 ) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
     // 从请求体解析 MCP JSON-RPC 信息
-    let json: serde_json::Value = serde_json::from_slice(body_bytes)
+    let mut json: serde_json::Value = serde_json::from_slice(body_bytes)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("JSON 解析失败: {}", e)))?;
     let rpc_id = json.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let arguments = json
@@ -231,10 +250,27 @@ fn handle_write(
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
+    // store_memory：代理本地生成 memory_id，注入转发请求 arguments，
+    // 保证即时 ACK 返回的 ID 与后端落库 ID 一致（后端 INSERT OR REPLACE 幂等）
+    let mut forward_body = json.clone();
+    let generated_id = if write_method == "store_memory" {
+        let memory_id = uuid::Uuid::new_v4().to_string();
+        if let Some(args) = forward_body
+            .get_mut("params")
+            .and_then(|p| p.get_mut("arguments"))
+            .and_then(|a| a.as_object_mut())
+        {
+            args.insert("memory_id".to_string(), serde_json::Value::String(memory_id.clone()));
+        }
+        Some(memory_id)
+    } else {
+        None
+    };
+
     // 生成立即返回的响应
     let result = match write_method {
         "store_memory" => {
-            let memory_id = uuid::Uuid::new_v4().to_string();
+            let memory_id = generated_id.unwrap_or_default();
             let namespace = arguments
                 .get("namespace")
                 .and_then(|v| v.as_str())
@@ -255,11 +291,14 @@ fn handle_write(
         }
     };
 
-    // 构建 JSON-RPC 成功响应
+    // 构建 JSON-RPC 成功响应。
+    // resultType 必须携带：2026-07-28 协议的客户端（如 ZCode discover 生命周期）
+    // 对 tools/call 结果强制校验该字段，缺失直接报协议错（老协议客户端按规范忽略未知字段，兼容）
     let response_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": rpc_id,
         "result": {
+            "resultType": "complete",
             "content": [{
                 "type": "text",
                 "text": serde_json::to_string(&result).unwrap_or_default()
@@ -267,12 +306,12 @@ fn handle_write(
         }
     });
 
-    // 入队：将原始请求交给后台 worker 转发
+    // 入队：将（注入 memory_id 后的）原始请求交给后台 worker 转发
     let task = WriteTask {
         method: parts.method.to_string(),
         uri: parts.uri.to_string(),
         headers: parts.headers.clone(),
-        body: body_bytes.clone(),
+        body: bytes::Bytes::from(serde_json::to_vec(&forward_body).unwrap_or_default()),
     };
 
     match state.write_tx.try_send(task) {
@@ -311,9 +350,32 @@ fn handle_write(
         .unwrap())
 }
 
-/// 读操作：直接转发到远端 MCP 服务器
+/// 读操作：直接转发到远端 MCP 服务器（共享连接池；瞬时连接错误重试一次）
 async fn forward_request(
     parts: axum::http::request::Parts,
+    body_bytes: bytes::Bytes,
+    state: &ProxyState,
+    addr: &std::net::SocketAddr,
+    started: Instant,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    match forward_request_once(&parts, body_bytes.clone(), state, addr, started).await {
+        Ok(res) => Ok(res),
+        Err((status, msg)) if status == axum::http::StatusCode::BAD_GATEWAY => {
+            // 瞬时连接错误（如后端重启后旧连接失效）：换新连接重试一次
+            if msg.contains("SendRequest") || msg.contains("Connect") {
+                tracing::warn!(target: "proxy", error = %msg, "瞬时转发失败，重试一次");
+                forward_request_once(&parts, body_bytes, state, addr, started).await
+            } else {
+                Err((status, msg))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 单次转发（无重试）
+async fn forward_request_once(
+    parts: &axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     state: &ProxyState,
     addr: &std::net::SocketAddr,
@@ -346,11 +408,15 @@ async fn forward_request(
         }
     }
 
-    let client = build_http_client();
-    let res = client.request(forward_req).await.map_err(|e| {
-        tracing::error!(error = %e, "转发请求失败");
-        (axum::http::StatusCode::BAD_GATEWAY, format!("转发失败: {}", e))
-    })?;
+    // 共享连接池：跨请求复用连接，避免每请求新建连接与后端重启后的 stale 连接问题
+    let res = state
+        .http_client
+        .request(forward_req)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "转发请求失败");
+            (axum::http::StatusCode::BAD_GATEWAY, format!("转发失败: {}", e))
+        })?;
 
     tracing::info!(
         target: "proxy",
@@ -380,37 +446,55 @@ async fn forward_request(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// 写队列后台 worker：单线程依次转发写请求到后端
+/// 写队列后台 worker：单线程依次转发写请求到后端（共享连接池；瞬时错误重试一次）
 async fn write_worker(
     mut rx: tokio::sync::mpsc::Receiver<WriteTask>,
     target: String,
     server_auth_token: Option<String>,
+    client: SharedClient,
 ) {
     tracing::info!(target: "write_queue", "写队列 worker 已启动");
-    let client = build_http_client();
 
     while let Some(task) = rx.recv().await {
         let started = Instant::now();
         let method = task.method.clone();
 
-        match forward_write_task(&client, &task, &target, &server_auth_token).await {
-            Ok(status) => {
-                tracing::info!(
-                    target: "write_queue",
-                    method = %method,
-                    status = status,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "写操作已转发到后端"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "write_queue",
-                    method = %method,
-                    error = %e,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "写操作转发失败"
-                );
+        // 写转发失败即丢数据（客户端已收到 ACK），瞬时连接错误重试一次兜底；
+        // store_memory 注入了固定 memory_id 且后端 INSERT OR REPLACE，重试幂等安全
+        let mut attempt = 0;
+        loop {
+            match forward_write_task(&client, &task, &target, &server_auth_token).await {
+                Ok(status) => {
+                    tracing::info!(
+                        target: "write_queue",
+                        method = %method,
+                        status = status,
+                        attempt,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "写操作已转发到后端"
+                    );
+                    break;
+                }
+                Err(e) if attempt == 0 && is_transient_legacy_error(&e) => {
+                    attempt += 1;
+                    tracing::warn!(
+                        target: "write_queue",
+                        method = %method,
+                        error = %e,
+                        "写转发瞬时失败，重试"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "write_queue",
+                        method = %method,
+                        error = %e,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "写操作转发失败（已丢弃）"
+                    );
+                    break;
+                }
             }
         }
     }
@@ -418,9 +502,15 @@ async fn write_worker(
     tracing::warn!(target: "write_queue", "写队列 worker 退出（channel 已关闭）");
 }
 
+/// 判断 legacy client 错误是否为瞬时连接错误
+fn is_transient_legacy_error(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("SendRequest") || s.contains("Connect") || s.contains("channel closed")
+}
+
 /// 转发单个写任务到后端
 async fn forward_write_task(
-    client: &hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, axum::body::Body>,
+    client: &SharedClient,
     task: &WriteTask,
     target: &str,
     server_auth_token: &Option<String>,
@@ -432,11 +522,14 @@ async fn forward_write_task(
         .uri(target_uri)
         .body(axum::body::Body::from(task.body.clone()))?;
 
-    // 复制 headers
+    // 复制 headers（跳过 hop-by-hop 与 content-length——body 已重新序列化注入
+    // memory_id，长度与原始请求不同，陈旧 content-length 会导致后端 415/解析失败；
+    // hyper 会按实际 body 大小自动补 content-length）
     for (key, value) in &task.headers {
-        if !is_hop_by_hop(key.as_str()) {
-            forward_req.headers_mut().insert(key.clone(), value.clone());
+        if is_hop_by_hop(key.as_str()) || key.as_str().eq_ignore_ascii_case("content-length") {
+            continue;
         }
+        forward_req.headers_mut().insert(key.clone(), value.clone());
     }
 
     // 确保 Accept header 包含 MCP 所需的两种类型
