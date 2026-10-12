@@ -449,8 +449,8 @@ async fn forward_request_once(
 }
 
 /// 写队列后台 worker：单线程依次转发写请求到后端。
-/// 客户端已收到 ACK，转发失败绝不能丢——重试后仍失败的一律落盘 journal，
-/// worker 启动时（含代理重启后）重放 journal，成功一条删一条。
+/// 客户端已收到 ACK，转发失败绝不能丢——重试后仍失败的一律落盘 journal。
+/// journal 定期重放（含代理重启后），成功一条删一条。
 async fn write_worker(
     mut rx: tokio::sync::mpsc::Receiver<WriteTask>,
     target: String,
@@ -460,17 +460,39 @@ async fn write_worker(
 ) {
     tracing::info!(target: "write_queue", "写队列 worker 已启动");
 
-    // 启动先重放上次遗留的失败 journal（代理重启丢的是内存队列，落盘的不丢）
+    // 启动先重放上次遗留的失败 journal
     journal_replay_all(&client, &target, &server_auth_token, std::path::Path::new(&journal_dir)).await;
 
-    while let Some(task) = rx.recv().await {
+    // 每 30s 触发一次 journal 重放（运行期间堆积的失败写入也能被补发）
+    let mut replay_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    replay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let task = tokio::select! {
+            biased;
+            Some(task) = rx.recv() => task,
+            _ = replay_interval.tick() => {
+                // 定期重放堆积的 journal（重放函数自建新 client 避免陈旧连接）
+                journal_replay_all(&client, &target, &server_auth_token,
+                    std::path::Path::new(&journal_dir)).await;
+                continue;
+            }
+            else => break,
+        };
+
         let started = Instant::now();
         let method = task.method.clone();
 
-        // store_memory 注入了固定 memory_id 且后端 INSERT OR REPLACE，重试幂等安全
+        // store_memory 注入了固定 memory_id 且后端 INSERT OR REPLACE，重试幂等安全。
+        // 每次重试用新建 client（新连接），避免共享池中的陈旧连接反复 SendRequest 失败
         let mut attempt = 0;
         loop {
-            match forward_write_task(&client, &task, &target, &server_auth_token).await {
+            let attempt_client = if attempt == 0 {
+                client.clone()
+            } else {
+                build_http_client()
+            };
+            match forward_write_task(&attempt_client, &task, &target, &server_auth_token).await {
                 // 非 2xx 同样是失败（此前 415 曾被当成功记 INFO，后端拒收但客户端已 ACK）
                 Ok(status) if (200..300).contains(&status) => {
                     tracing::info!(
@@ -483,10 +505,10 @@ async fn write_worker(
                     );
                     break;
                 }
-                Ok(status) if attempt == 0 && (500..600).contains(&status) => {
+                Ok(status) if attempt < 2 && (500..600).contains(&status) => {
                     attempt += 1;
                     tracing::warn!(target: "write_queue", method = %method, status = status, "后端 5xx，重试");
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
                 Ok(status) => {
                     tracing::error!(
@@ -499,15 +521,16 @@ async fn write_worker(
                     journal_persist(std::path::Path::new(&journal_dir), &task);
                     break;
                 }
-                Err(e) if attempt == 0 && is_transient_legacy_error(&e) => {
+                Err(e) if attempt < 2 && is_transient_legacy_error(&e) => {
                     attempt += 1;
                     tracing::warn!(
                         target: "write_queue",
                         method = %method,
                         error = %e,
-                        "写转发瞬时失败，重试"
+                        attempt,
+                        "写转发瞬时失败，用新连接重试"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300 * attempt)).await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -584,6 +607,9 @@ async fn journal_replay_all(
             headers: axum::http::HeaderMap::new(),
             body: bytes::Bytes::from(entry["body"].as_str().unwrap_or("").to_string().into_bytes()),
         };
+        // 每条用独立 client + 间隔：SSH 隧道对快速连续请求会关闭连接
+        //（"connection closed before message completed"），独立 client 确保新 TCP 连接
+        // 用传入 client 转发（真实的失败根因是服务端 char-boundary panic，已修）
         match forward_write_task(client, &task, target, server_auth_token).await {
             Ok(status) if (200..300).contains(&status) => {
                 let _ = std::fs::remove_file(&file);
@@ -596,6 +622,8 @@ async fn journal_replay_all(
                 tracing::error!(target: "write_queue", file = %file.display(), error = %e, "journal 重放失败，保留文件");
             }
         }
+        // 条目间隔 100ms，让 SSH 隧道有时间建立新连接
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -605,7 +633,9 @@ fn is_transient_legacy_error(err: &anyhow::Error) -> bool {
     s.contains("SendRequest") || s.contains("Connect") || s.contains("channel closed")
 }
 
-/// 转发单个写任务到后端
+/// 转发单个写任务到后端。
+/// 注：曾误判为"大 body 在 SSH 隧道上必失败"，实为服务端请求日志中间件按字节
+/// 截断中文 body 触发 char-boundary panic（已修 main.rs）。此处恢复常规 HTTP 客户端。
 async fn forward_write_task(
     client: &SharedClient,
     task: &WriteTask,
@@ -620,7 +650,7 @@ async fn forward_write_task(
         .body(axum::body::Body::from(task.body.clone()))?;
 
     // 复制 headers（跳过 hop-by-hop 与 content-length——body 已重新序列化注入
-    // memory_id，长度与原始请求不同，陈旧 content-length 会导致后端 415/解析失败；
+    // memory_id，长度与原始请求不同，陈旧 content-length 会导致后端 415；
     // hyper 会按实际 body 大小自动补 content-length）
     for (key, value) in &task.headers {
         if is_hop_by_hop(key.as_str()) || key.as_str().eq_ignore_ascii_case("content-length") {
@@ -638,10 +668,7 @@ async fn forward_write_task(
     }
 
     // 确保 Content-Type（journal 重放的 task headers 为空，缺它后端 415）
-    if !task
-        .headers
-        .contains_key(axum::http::header::CONTENT_TYPE)
-    {
+    if !task.headers.contains_key(axum::http::header::CONTENT_TYPE) {
         forward_req.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
@@ -658,7 +685,16 @@ async fn forward_write_task(
         }
     }
 
-    let res = client.request(forward_req).await?;
+    let res = client.request(forward_req).await.map_err(|e| {
+        // 输出完整错误链（hyper_util 的 Display 太简略，source 才有根因）
+        let mut chain = vec![format!("{}", e)];
+        let mut src = std::error::Error::source(&e);
+        while let Some(s) = src {
+            chain.push(format!("{}", s));
+            src = std::error::Error::source(s);
+        }
+        anyhow::anyhow!("{} | chain: {}", e, chain.join(" -> "))
+    })?;
     Ok(res.status().as_u16())
 }
 
@@ -670,6 +706,8 @@ fn parse_target(target: &str) -> Result<hyper::Uri, String> {
 }
 
 /// 构建 HTTP 客户端（连接池）
+/// pool_max_idle_per_host=1：限制每主机最多 1 条空闲连接，防止陈旧连接累积
+/// pool_idle_timeout=10s：空闲 10 秒即驱逐，比 30s 更快清理死连接
 fn build_http_client(
 ) -> hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, axum::body::Body> {
     let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
@@ -677,7 +715,8 @@ fn build_http_client(
     connector.enforce_http(true);
 
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
         .build(connector)
 }
 

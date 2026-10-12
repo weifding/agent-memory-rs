@@ -305,7 +305,17 @@ async fn main() -> Result<()> {
 
                     let body_text = if parts.method == axum::http::Method::POST {
                         let t = String::from_utf8_lossy(&bytes);
-                        if t.len() > 2000 { format!("{}…[+{}B]", &t[..2000], t.len() - 2000) } else { t.to_string() }
+                        if t.len() > 2000 {
+                            // 按字符边界安全截断：中文等 UTF-8 多字节字符不能从中间切开，
+                            // 否则 &t[..2000] 会 panic（char boundary）并丢弃整条连接
+                            let mut end = 2000;
+                            while end > 0 && !t.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}…[+{}B]", &t[..end], t.len() - end)
+                        } else {
+                            t.to_string()
+                        }
                     } else {
                         String::new()
                     };
