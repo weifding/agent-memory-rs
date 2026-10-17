@@ -391,15 +391,14 @@ same memory.
 Add to the MCP section of `cordis.yml`:
 
 ```yaml
-- id: mcp-agent-memory
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    serverName: agent-memory
-    transport: streamable-http
-    url: http://127.0.0.1:8888/mcp
-    # headers:                          # only when auth_token is enabled
-    #   Authorization: 'Bearer <token>'
-    toolCallTimeoutMs: 60000
+- insert:
+    - id: mcp-agent-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: agent-memory
+        transport: streamable-http
+        url: http://127.0.0.1:8888/mcp
+        toolCallTimeoutMs: 60000
 ```
 
 stdio fallback (each DSH session spawns its own process; the embedding model
@@ -407,14 +406,15 @@ cold-loads per session and Kùzu queues through flock — only recommended if yo
 do not want a resident service):
 
 ```yaml
-- id: mcp-agent-memory
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    serverName: agent-memory
-    transport: stdio
-    command: /Users/dingweifeng/.agent-memory/bin/agent-memory-server
-    env:
-      AGENT_MEMORY_GRAPH__ENABLED: 'true'
+- insert:
+    - id: mcp-agent-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: agent-memory
+        transport: stdio
+        command: /Users/dingweifeng/.agent-memory/bin/agent-memory-server
+        env:
+          AGENT_MEMORY_GRAPH__ENABLED: 'true'
 ```
 
 Integration notes:

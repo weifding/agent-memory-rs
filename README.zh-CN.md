@@ -325,29 +325,29 @@ DSH 会话（如 `mcp__agent-memory__search_memory`）。**推荐 streamable-htt
 在 `cordis.yml` 的 MCP 配置段添加：
 
 ```yaml
-- id: mcp-agent-memory
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    serverName: agent-memory
-    transport: streamable-http
-    url: http://127.0.0.1:8888/mcp
-    # headers:                          # 仅当服务启用 auth_token 时需要
-    #   Authorization: 'Bearer <token>'
-    toolCallTimeoutMs: 60000
+- insert:
+    - id: mcp-agent-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: agent-memory
+        transport: streamable-http
+        url: http://127.0.0.1:8888/mcp
+        toolCallTimeoutMs: 60000
 ```
 
 stdio 备选（每个 DSH 会话拉起独立进程；嵌入模型反复冷加载、Kùzu 走 flock 排队，
 仅推荐"不想跑常驻服务"的场景）：
 
 ```yaml
-- id: mcp-agent-memory
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    serverName: agent-memory
-    transport: stdio
-    command: /Users/dingweifeng/.agent-memory/bin/agent-memory-server
-    env:
-      AGENT_MEMORY_GRAPH__ENABLED: 'true'
+- insert:
+    - id: mcp-agent-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: agent-memory
+        transport: stdio
+        command: /Users/dingweifeng/.agent-memory/bin/agent-memory-server
+        env:
+          AGENT_MEMORY_GRAPH__ENABLED: 'true'
 ```
 
 接入要点：
