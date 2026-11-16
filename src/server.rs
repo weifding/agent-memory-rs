@@ -155,16 +155,16 @@ impl ServerHandler for MemoryHandler {
             ),
             Tool::new(
                 "search_memory",
-                "Search memories by semantic similarity (中文友好)",
-                schema(json!({"type":"object","properties":{"query":{"type":"string"},"namespace":{"type":"string"},"top_k":{"type":"integer"},"category":{"type":"string"}},"required":["query"]})),
+                "Search memories by semantic similarity (中文友好). 注意：语义 top-k 检索非穷举——召回受查询词与 top_k 限制，宽主题建议 top_k>=20 并换多组关键词；需要某命名空间的全量/分批浏览请用 list_memories",
+                schema(json!({"type":"object","properties":{"query":{"type":"string"},"namespace":{"type":"string"},"top_k":{"type":"integer","description":"返回条数上限，默认与上限见服务端；宽主题检索建议 20+"},"category":{"type":"string"}},"required":["query"]})),
             ),
             Tool::new(
                 "update_memory",
-                "Update an existing memory. 更新 content 时同样受 10000 字符上限，超长自动截断",
-                schema(json!({"type":"object","properties":{"memory_id":{"type":"string"},"content":{"type":"string","maxLength":10000,"description":"更新后的正文，单条上限 10000 字符，超长截断"},"importance":{"type":"number"},"category":{"type":"string"}},"required":["memory_id"]})),
+                "Update an existing memory. memory_id 必须是完整 36 位 UUID（不支持前缀）。更新 content 时同样受 10000 字符上限，超长自动截断",
+                schema(json!({"type":"object","properties":{"memory_id":{"type":"string","description":"完整 36 位 UUID，不支持前缀"},"content":{"type":"string","maxLength":10000,"description":"更新后的正文，单条上限 10000 字符，超长截断"},"importance":{"type":"number"},"category":{"type":"string"}},"required":["memory_id"]})),
             ),
-            Tool::new("get_memory", "Get a memory by ID", schema(json!({"type":"object","properties":{"memory_id":{"type":"string"}},"required":["memory_id"]}))),
-            Tool::new("delete_memory", "Delete a memory by ID. 清理过旧记忆的推荐流程：1) get_memory_stats 查看总量和分类分布；2) list_memories 按 category 分批浏览，关注 importance<0.7 的旧数据（如 meeting-minutes/fact 中的细节记录）；3) 对确认无用的记忆逐条 delete_memory。建议保留 importance>=0.9 的关键决策/安全/架构记忆，importance 0.7-0.9 的按时效性判断，importance<0.7 且超过 7 天的可优先清理。", schema(json!({"type":"object","properties":{"memory_id":{"type":"string"}},"required":["memory_id"]}))),
+            Tool::new("get_memory", "Get a memory by ID. memory_id 必须是完整的 36 位 UUID（如 ffc45dfb-d812-40fa-bd6f-0c2c56315888）；不支持短前缀/片段匹配，传短 ID 会返回 not_found。完整 ID 以 store/search/list 的返回为准。", schema(json!({"type":"object","properties":{"memory_id":{"type":"string","description":"完整 36 位 UUID，不支持前缀"}},"required":["memory_id"]}))),
+            Tool::new("delete_memory", "Delete a memory by ID（完整 36 位 UUID，不支持前缀）. 清理过旧记忆的推荐流程：1) get_memory_stats 查看总量和分类分布；2) list_memories 按 category 分批浏览，关注 importance<0.7 的旧数据（如 meeting-minutes/fact 中的细节记录）；3) 对确认无用的记忆逐条 delete_memory。建议保留 importance>=0.9 的关键决策/安全/架构记忆，importance 0.7-0.9 的按时效性判断，importance<0.7 且超过 7 天的可优先清理。", schema(json!({"type":"object","properties":{"memory_id":{"type":"string","description":"完整 36 位 UUID，不支持前缀"}},"required":["memory_id"]}))),
             Tool::new("list_memories", "List memories with pagination. 可按 category 过滤，返回内容含 importance 和 created_at，用于识别过旧低价值记忆。配合 delete_memory 实现清理。", schema(json!({"type":"object","properties":{"namespace":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"category":{"type":"string"}}}))),
             Tool::new("get_memory_stats", "Get memory statistics. 返回 total_memories 和 by_category 分布，是清理过旧记忆的第一步——先了解总量再制定清理策略。", schema(json!({"type":"object","properties":{"namespace":{"type":"string"}}}))),
         ];
